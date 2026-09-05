@@ -32,6 +32,16 @@ class LLMConfig:
 
 
 @dataclass
+class EmbeddingConfig:
+    base_url: str
+    api_key: str
+    model: str
+    dimensions: int
+    instruction: str = ""
+    chroma_dir: str = "warehouse/chroma"
+
+
+@dataclass
 class Config:
     llm: LLMConfig
     alt_llm: LLMConfig | None
@@ -43,6 +53,7 @@ class Config:
     semantic_layer_path: Path
     meta_dir: Path
     reference_date: str | None = None
+    embedding: EmbeddingConfig | None = None
 
 
 def _llm_from_env(prefix: str) -> LLMConfig | None:
@@ -66,6 +77,14 @@ def _llm_from_env(prefix: str) -> LLMConfig | None:
 def load_config(env_path: str | Path | None = None) -> Config:
     load_dotenv(env_path or PROJECT_ROOT / ".env")
     langfuse_enabled = os.environ.get("LANGFUSE_ENABLED", "false").lower() == "true"
+    emb = EmbeddingConfig(
+        base_url=os.environ.get("EMBEDDING_BASE_URL", ""),
+        api_key=os.environ.get("EMBEDDING_API_KEY", ""),
+        model=os.environ.get("EMBEDDING_MODEL", ""),
+        dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1024")),
+        instruction=os.environ.get("EMBEDDING_INSTRUCTION", ""),
+        chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
+    )
     return Config(
         llm=_llm_from_env("LLM"),
         alt_llm=_llm_from_env("ALT_LLM"),
@@ -79,6 +98,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         ),
         meta_dir=Path(os.environ.get("META_DIR", "meta")),
         reference_date=(os.environ.get("REFERENCE_DATE") or None),
+        embedding=(emb if emb.api_key and emb.model else None),
     )
 
 

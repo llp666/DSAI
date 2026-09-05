@@ -1,7 +1,8 @@
-"""agent/retriever.py：阶段一硬编码 Top-3 表检索。
+"""agent/retriever.py：检索器。
 
-从 meta/table_docs.json 取 orders / order_items / refunds 三张核心表的结构，
-渲染为注入 Prompt 的受控文本（对应方案 5.3 的动态注入格式，本阶段先硬编码）。
+- 阶段一：硬编码 Top-3（orders/order_items/refunds）注入；
+- 阶段二：向量检索 v1——ChromaDB 召回 Top-k 表文档注入。
+两种模式并存，pipeline 未接入向量前回落硬编码。
 """
 
 from __future__ import annotations
@@ -9,18 +10,32 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# 阶段一固定 Top-3（覆盖月度 GMV/净销/复购率评测所需的全部表）
+# 阶段一硬编码 Top-3（月度 GMV/净销/复购率评测所需表）
 TOP3_KEYS = ["ods.orders", "ods.order_items", "ods.refunds"]
 
 
 class Retriever:
     def __init__(self, meta_dir: Path):
         docs = json.loads((Path(meta_dir) / "table_docs.json").read_text(encoding="utf-8"))
-        self._docs = {k: docs[k] for k in TOP3_KEYS}
+        self._docs = docs  # 全量表文档（含 301 张）
 
     def retrieve(self, question: str, k: int = 3) -> list[dict]:
-        # 阶段一：忽略 question 语义，固定返回 Top-3（检索层待阶段二接入向量库）
+        """阶段一：忽略 question，固定返回硬编码 Top-3。"""
         return [self._docs[key] for key in TOP3_KEYS[:k]]
+
+    def retrieve_vector(self, question: str, vector_store, *,
+                        top_tables: int = 5,
+                        where: dict | None = None) -> list[dict]:
+        """阶段二：向量召回，过滤出表文档（排除场景卡），返回 Top-k 表文档。"""
+        hits = vector_store.query(question, top_k=top_tables + 5, where=where)
+        table_ids = [h["id"] for h in hits if h["doc_type"] == "table"]
+        out = []
+        for t in table_ids:
+            if t in self._docs:
+                out.append(self._docs[t])
+            if len(out) >= top_tables:
+                break
+        return out
 
     @staticmethod
     def render(tables: list[dict]) -> str:

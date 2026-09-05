@@ -1,0 +1,93 @@
+# 场景卡库：高频电商分析场景（检索层双检索的知识文档侧）
+# 每张卡：场景 + 涉及表 + 典型问题 + 注意事项（关联条件/口径陷阱）
+# involved_tables 使用物理表全名（= meta/table_docs.json 的 key）
+scenarios:
+  - id: scn_advertising
+    name: 广告投放分析
+    domain: 营销域
+    involved_tables: [ods.ads_daily_stats, dim.ads_campaigns, dim.channels, ods.ad_conversions, ods.orders]
+    typical_questions:
+      - 各渠道ROI与转化情况
+      - 哪个渠道投放效果最差
+      - 广告归因GMV与花费对比
+    notes:
+      - 渠道维度经 ads_campaigns 关联 channels；ROI = attributed_gmv / spend
+      - 负 ROI 渠道（channel_cps_03 / channel_sms_02）是诊断素材
+
+  - id: scn_inventory_alert
+    name: 供应链库存预警
+    domain: 供应链与库存域
+    involved_tables: [ods.inventory_snapshot, ods.purchase_orders, ods.purchase_order_items, ods.warehouse_stock, ods.stock_moves, dim.products]
+    typical_questions:
+      - 哪些SKU面临断货
+      - 呆滞库存有多少
+      - 补货在途情况
+    notes:
+      - 断货看期末快照 on_hand=0；呆滞看 on_hand/日均出库>90
+      - 日均销量需从 stock_moves outbound 聚合
+
+  - id: scn_repurchase
+    name: 用户复购分析
+    domain: 用户域
+    involved_tables: [ods.orders, dim.users, ods.order_items, ods.user_profiles]
+    typical_questions:
+      - 复购率是多少
+      - 老客占比与用户分层
+      - 复购周期分布
+    notes:
+      - 复购率=90天窗口内下单≥2个不同日期的用户占比（口径见语义层）
+
+  - id: scn_promo_review
+    name: 大促复盘
+    domain: 订单域
+    involved_tables: [ods.orders, ods.order_items, ods.refunds, dim.promotions, dim.dim_date]
+    typical_questions:
+      - 618/双11大促GMV与退款
+      - 促销日订单量与环比
+      - 大促后退货率
+    notes:
+      - 促销日 is_promo 标记在 dim_date；大促日单量有促销因子抬升
+
+  - id: scn_sales_attribution
+    name: 销售归因
+    domain: 订单域
+    involved_tables: [ods.orders, ods.order_items, dim.products, dim.categories, ods.refunds]
+    typical_questions:
+      - 各品类销售额贡献
+      - 净销售额与毛利
+      - 卖得最好的SKU
+    notes:
+      - 品类维度需经 order_items→products→categories；品类销售额用 item 级口径避免扇出
+
+  - id: scn_supply_chain
+    name: 供应链运营
+    domain: 供应链与库存域
+    involved_tables: [ods.purchase_orders, ods.purchase_order_items, dim.suppliers, ods.inbound_records, dim.warehouses, ods.warehouse_stock]
+    typical_questions:
+      - 供应商补货周期
+      - 在途库存与入库
+      - 仓库库存分布
+    notes:
+      - PO 状态枚举 received/in_transit/cancelled；入库经 inbound_records 关联
+
+  - id: scn_refund_analysis
+    name: 退款分析
+    domain: 订单域
+    involved_tables: [ods.refunds, ods.orders, ods.order_items, dim.products, dim.categories]
+    typical_questions:
+      - 退款率与退款原因分布
+      - 哪些品类退货最多
+      - 扣退款后的净销售额
+    notes:
+      - 退款按 refund_date 归集（跨月扣减）；退款率=当月退款/当月GMV
+
+  - id: scn_user_segmentation
+    name: 用户分层
+    domain: 用户域
+    involved_tables: [dim.users, ods.orders, ods.user_profiles, ods.user_level_log]
+    typical_questions:
+      - 新老用户占比
+      - 不同城市线级的消费差异
+      - 高价值用户画像
+    notes:
+      - city_tier 枚举：一线/新一线/二线/三线/四线及以下（含脏数据 NULL）

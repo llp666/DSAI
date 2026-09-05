@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsai.local/corpus.schema.json",
+  "title": "检索语料条目 Schema（ChromaDB 入库前校验，不过拒收）",
+  "type": "object",
+  "required": ["id", "doc_type", "domain", "document", "metadata"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "doc_type": { "type": "string", "enum": ["table", "scenario"] },
+    "domain": { "type": "string" },
+    "document": { "type": "string", "minLength": 10 },
+    "metadata": {
+      "type": "object",
+      "required": ["updated_at"],
+      "properties": {
+        "updated_at": { "type": "string" },
+        "tables": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
