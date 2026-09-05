@@ -20,6 +20,14 @@ class Executor:
         rows = self._con.execute(sql).fetchall()
         return rows[0] if rows else None
 
+    def explain_dry_run(self, sql: str) -> str | None:
+        """EXPLAIN 干跑：验证 SQL 可执行性（不实际执行，毫秒级），返回错误或 None。"""
+        try:
+            self._con.execute(f"EXPLAIN {sql}").fetchall()
+            return None
+        except Exception as e:
+            return str(e)
+
     def close(self) -> None:
         self._con.close()
 

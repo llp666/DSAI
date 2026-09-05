@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from jinja2 import Environment, FileSystemLoader
 from pydantic import ValidationError
 
 from .compiler import CompileError, compile_query
@@ -20,6 +21,7 @@ from .config import Config, load_config, resolve
 from .executor import Executor
 from .llm import LLMClient, build_llm
 from .prompts import build_system_prompt
+from .repair import try_repair
 from .retriever import Retriever
 from .semantic_layer import load_semantic_layer
 from .tracing import build_tracer
@@ -37,6 +39,10 @@ class Pipeline:
         self.executor = Executor(resolve(self.cfg.duckdb_path))
         self.tracer = build_tracer(self.cfg)
         self._llm: LLMClient | None = None
+        self._env = Environment(
+            loader=FileSystemLoader(resolve(Path("agent/templates")))
+        )
+        self._answer_tpl = self._env.get_template("answer.j2")
 
     def _get_llm(self, use_alt: bool) -> LLMClient:
         if use_alt:
@@ -94,16 +100,21 @@ class Pipeline:
             parts.append(f"{v}{display.get(f.dim, f.dim)}")
         return " · ".join(parts)
 
-    def _assemble_answer(self, sq: SemanticQuery, value: Any) -> str:
+    def _assemble_answer(self, sq: SemanticQuery, value: Any,
+                         retrieved_tables: list[str], sql: str) -> str:
         meta = self.layer.metrics[sq.metric]
         ym = sq.window.value
         suffix = self._dim_suffix(sq)
-        head = f"【{meta['display_name']}】{ym}" + (f" · {suffix}" if suffix else "")
         if value is None:
-            return f"{head} 无数据"
-        return (
-            f"{head} = {self._format_value(sq.metric, value)}\n"
-            f"口径：{meta['description']}"
+            return f"【{meta['display_name']}】{ym}" + (f" · {suffix}" if suffix else "") + " 无数据"
+        return self._answer_tpl.render(
+            metric_name=meta["display_name"],
+            month=ym,
+            dim_suffix=suffix,
+            value_text=self._format_value(sq.metric, value),
+            caliber=meta["description"],
+            retrieved_tables=retrieved_tables,
+            sql=sql,
         )
 
     # ---------- 主入口 ----------
@@ -156,7 +167,8 @@ class Pipeline:
                 t.set_trace_io(input={"question": question}, output={"error": state["execution_error"]})
                 return state
 
-            # 3) 编译 SQL
+            # 3) 编译 SQL + EXPLAIN 干跑校验（确定性优先：编译失败先走修复规则）
+            sql = None
             with t.span("compile") as sp:
                 try:
                     sql = compile_query(sq, self.layer)
@@ -167,7 +179,26 @@ class Pipeline:
                 state["compiled_sql"] = sql
                 sp.update(output={"sql": sql})
 
-            # 4) 只读执行
+            # 4) EXPLAIN 干跑：编译通过后先验可行性（read_only 毫秒级）
+            dry_error = None
+            with t.span("dry_run") as sp:
+                dry_error = self.executor.explain_dry_run(sql)
+                sp.update(output={"ok": dry_error is None, "error": dry_error})
+
+            # 若干跑失败 → 确定性修复规则表（阶段三纠错轨地基）
+            if dry_error:
+                repaired = try_repair(dry_error, sql)
+                if repaired:
+                    sql = repaired
+                    state["compiled_sql"] = sql
+                    # 修复后复验
+                    dry_error = self.executor.explain_dry_run(sql)
+                if dry_error:
+                    state["execution_error"] = f"SQL 干跑校验失败（确定性修复未覆盖）：{dry_error}"
+                    state["answer"] = f"SQL 不可执行：{dry_error}"
+                    return state
+
+            # 5) 只读执行
             with t.span("execute") as sp:
                 try:
                     rows = self.executor.execute(sql)
@@ -180,9 +211,10 @@ class Pipeline:
                 state["execution_result"] = value
                 sp.update(output={"result": value})
 
-            # 5) 回答组装（口径披露）
+            # 6) 回答组装（口径披露 + 命中表 + SQL 溯源）
             with t.span("answer") as sp:
-                answer = self._assemble_answer(sq, value)
+                answer = self._assemble_answer(
+                    sq, value, state["retrieved_tables"], state["compiled_sql"])
                 state["answer"] = answer
                 sp.update(output={"answer": answer})
 

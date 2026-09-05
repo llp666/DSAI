@@ -36,18 +36,33 @@ class OpenAICompatClient(LLMClient):
         self.last_usage: dict | None = None  # 最近一次调用的 token 用量（供埋点）
 
     def complete(self, system: str, user: str) -> str:
-        try:
-            resp = self._client.chat.completions.create(
-                model=self._cfg.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=self._cfg.temperature,
-                max_tokens=self._cfg.max_tokens,
+        import time
+
+        last_exc: Exception | None = None
+        for attempt in range(3):  # 429 限流退避重试（最多 3 次）
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self._cfg.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=self._cfg.temperature,
+                    max_tokens=self._cfg.max_tokens,
+                )
+            except Exception as e:  # 供应商网络/鉴权等错误统一包装
+                if "429" in str(e) and attempt < 2:
+                    time.sleep(3 * (attempt + 1))  # 指数退避 3s/6s
+                    last_exc = e
+                    continue
+                raise LLMError(
+                    f"LLM 调用失败 [{self._cfg.provider}/{self._cfg.model}]: {e}"
+                ) from e
+            break
+        else:
+            raise LLMError(
+                f"LLM 调用失败（限流重试3次仍失败）[{self._cfg.provider}/{self._cfg.model}]: {last_exc}"
             )
-        except Exception as e:  # 供应商网络/鉴权等错误统一包装
-            raise LLMError(f"LLM 调用失败 [{self._cfg.provider}/{self._cfg.model}]: {e}") from e
         u = resp.usage
         self.last_usage = {
             "input": getattr(u, "prompt_tokens", 0),

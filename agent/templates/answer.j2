@@ -1,0 +1,6 @@
+【{{ metric_name }}】{{ month }}{% if dim_suffix %} · {{ dim_suffix }}{% endif %} = {{ value_text }}
+
+口径：{{ caliber }}
+
+数据来源表：{% for t in retrieved_tables %}{{ t }}{% if not loop.last %}、{% endif %}{% endfor %}
+SQL 溯源：{{ sql }}
