@@ -1,0 +1,20 @@
+# 中间产物与数据库文件（数据永远可由脚本+config+seed 再生成）
+warehouse/
+meta/
+*.duckdb
+*.duckdb.wal
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 密钥与本地配置
+.env
+.env.langfuse
+
+# 评测产物
+eval/reports/
+eval/results/

@@ -1,0 +1,87 @@
+services:
+  langfuse-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - langfuse_clickhouse:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client -q 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  langfuse-minio:
+    image: minio/minio:latest
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse_minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    env_file: .env.langfuse
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://$(hostname):3000/api/public/health -T 5 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 15
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    env_file: .env.langfuse
+    depends_on:
+      langfuse-web:
+        condition: service_healthy
+
+volumes:
+  langfuse_pgdata:
+  langfuse_clickhouse:
+  langfuse_minio:
+  langfuse_redis:

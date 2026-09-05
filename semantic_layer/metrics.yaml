@@ -1,0 +1,32 @@
+version: v0
+description: 阶段一语义层 v0 —— 3 个核心指标，口径与 meta/ground_truth.json 严格一致
+metrics:
+  gmv:
+    display_name: GMV
+    description: 月度GMV，按订单创建月份归集，排除待支付订单（order_status≠'1'），不扣退款
+    base: ods.orders
+    expression: SUM(pay_amount)
+    filters:
+      - "order_status != '1'"
+    time_column: created_at
+    time_grain: month
+  net_sales_amount:
+    display_name: 净销售额
+    description: 月度净销售额 = 当月订单GMV − 当月实际退款额（退款按发生月 refund_date 归集，跨月扣减）
+    base: ods.orders
+    expression: SUM(pay_amount)
+    filters:
+      - "order_status != '1'"
+    time_column: created_at
+    deduction:
+      base: ods.refunds
+      expression: SUM(refund_amount)
+      time_column: refund_date
+    time_grain: month
+  repurchase_rate:
+    display_name: 复购率
+    description: 观察月内近90天窗口[月末−89天,月末]有单用户中「下单≥2个不同日期」的用户占比
+    base: ods.orders
+    window: 90d
+    window_anchor: month_end
+    time_grain: month
