@@ -18,7 +18,8 @@ from .vector_store import VectorStore
 
 def main() -> int:
     cfg = load_config()
-    if not cfg.embedding:
+    emb_cfg = cfg.embedding or cfg.alt_embedding
+    if not emb_cfg:
         print("缺少 EMBEDDING_* 配置（.env），跳过入库")
         return 1
     updated_at = date.today().isoformat()
@@ -34,13 +35,15 @@ def main() -> int:
     print(f"  表文档 {n_table} 条、场景卡 {n_scn} 张")
 
     embedder = Embedder(
-        base_url=cfg.embedding.base_url, api_key=cfg.embedding.api_key,
-        model=cfg.embedding.model, dimensions=cfg.embedding.dimensions,
-        instruction=cfg.embedding.instruction,
+        provider=emb_cfg.provider, base_url=emb_cfg.base_url,
+        api_key=emb_cfg.api_key, model=emb_cfg.model,
+        dimensions=emb_cfg.dimensions, instruction=emb_cfg.instruction,
+        task=emb_cfg.task,
     )
-    store = VectorStore(cfg.embedding.chroma_dir, embedder)
+    store = VectorStore(emb_cfg.chroma_dir, embedder)
     n = store.rebuild(entries)
-    print(f"ChromaDB 入库完成：{n} 条 → {resolve(Path(cfg.embedding.chroma_dir))}")
+    print(f"ChromaDB 入库完成：{n} 条（embedding={emb_cfg.provider}/{emb_cfg.model}）"
+          f" → {resolve(Path(emb_cfg.chroma_dir))}")
     return 0
 
 

@@ -33,12 +33,21 @@ class LLMConfig:
 
 @dataclass
 class EmbeddingConfig:
-    base_url: str
-    api_key: str
-    model: str
-    dimensions: int
+    provider: str = "gitee"
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    dimensions: int = 1024
     instruction: str = ""
+    task: str = "retrieval.query"
     chroma_dir: str = "warehouse/chroma"
+
+
+@dataclass
+class RerankConfig:
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
 
 
 @dataclass
@@ -54,6 +63,8 @@ class Config:
     meta_dir: Path
     reference_date: str | None = None
     embedding: EmbeddingConfig | None = None
+    alt_embedding: EmbeddingConfig | None = None
+    rerank: RerankConfig | None = None
 
 
 def _llm_from_env(prefix: str) -> LLMConfig | None:
@@ -78,12 +89,28 @@ def load_config(env_path: str | Path | None = None) -> Config:
     load_dotenv(env_path or PROJECT_ROOT / ".env")
     langfuse_enabled = os.environ.get("LANGFUSE_ENABLED", "false").lower() == "true"
     emb = EmbeddingConfig(
+        provider=os.environ.get("EMBEDDING_PROVIDER", "gitee"),
         base_url=os.environ.get("EMBEDDING_BASE_URL", ""),
         api_key=os.environ.get("EMBEDDING_API_KEY", ""),
         model=os.environ.get("EMBEDDING_MODEL", ""),
         dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1024")),
         instruction=os.environ.get("EMBEDDING_INSTRUCTION", ""),
+        task=os.environ.get("EMBEDDING_TASK", "retrieval.query"),
         chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
+    )
+    alt_emb = EmbeddingConfig(
+        provider=os.environ.get("ALT_EMBEDDING_PROVIDER", "jina"),
+        base_url=os.environ.get("ALT_EMBEDDING_BASE_URL", ""),
+        api_key=os.environ.get("ALT_EMBEDDING_API_KEY", ""),
+        model=os.environ.get("ALT_EMBEDDING_MODEL", ""),
+        dimensions=int(os.environ.get("ALT_EMBEDDING_DIMENSIONS", "1024")),
+        task=os.environ.get("ALT_EMBEDDING_TASK", "retrieval.query"),
+        chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
+    )
+    rerank = RerankConfig(
+        base_url=os.environ.get("RERANK_BASE_URL", ""),
+        api_key=os.environ.get("RERANK_API_KEY", ""),
+        model=os.environ.get("RERANK_MODEL", ""),
     )
     return Config(
         llm=_llm_from_env("LLM"),
@@ -99,6 +126,8 @@ def load_config(env_path: str | Path | None = None) -> Config:
         meta_dir=Path(os.environ.get("META_DIR", "meta")),
         reference_date=(os.environ.get("REFERENCE_DATE") or None),
         embedding=(emb if emb.api_key and emb.model else None),
+        alt_embedding=(alt_emb if alt_emb.api_key and alt_emb.model else None),
+        rerank=(rerank if rerank.api_key and rerank.model else None),
     )
 
 
