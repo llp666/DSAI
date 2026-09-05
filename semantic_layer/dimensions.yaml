@@ -1,0 +1,48 @@
+# 维度定义：维度 → 物理表 + 列 + 值字典（值画像）
+# item_grain: true 表示该维度细化到订单明细行（如品类/SKU），命中时订单级指标自动切 item 级口径，
+#               避免 order→order_items 1:N 扇出导致的 pay_amount 重复求和。
+dimensions:
+  category_type:
+    display_name: 品类
+    table: categories
+    column: category_type
+    item_grain: true
+    values: [服饰, 电子, 家居, 汽配, 其他]
+  city_tier:
+    display_name: 城市线级
+    table: users
+    column: city_tier
+    item_grain: false
+    values: [一线, 新一线, 二线, 三线, 四线及以下]
+  channel:
+    display_name: 渠道
+    table: channels
+    column: channel_id
+    item_grain: false
+    values:
+      - channel_cps_01
+      - channel_cps_02
+      - channel_cps_03
+      - channel_feeds_01
+      - channel_feeds_02
+      - channel_feeds_03
+      - channel_feeds_04
+      - channel_organic_01
+      - channel_organic_02
+      - channel_organic_03
+      - channel_organic_04
+      - channel_organic_05
+      - channel_organic_06
+      - channel_organic_07
+      - channel_organic_08
+      - channel_search_01
+      - channel_search_02
+      - channel_search_03
+      - channel_sms_01
+      - channel_sms_02
+  channel_type:
+    display_name: 渠道类型
+    table: channels
+    column: channel_type
+    item_grain: false
+    values: [cps, feeds, search, sms, organic]

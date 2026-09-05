@@ -1,32 +1,178 @@
-version: v0
-description: 阶段一语义层 v0 —— 3 个核心指标，口径与 meta/ground_truth.json 严格一致
+# 指标定义（阶段二 · 11 个核心指标）
+# 每个指标由若干 part（标量子查询）组成，combine 用 part 名做算术组合；
+# part 内 expression/filters/group_by 中出现的实体别名（=实体名）会被自动加入 JOIN 链（关系图 BFS 补全）。
+# item_expression：命中 item_grain 维度（品类等）时，订单级口径自动切换为明细级口径，避免 1:N 扇出重复求和。
 metrics:
   gmv:
     display_name: GMV
-    description: 月度GMV，按订单创建月份归集，排除待支付订单（order_status≠'1'），不扣退款
-    base: ods.orders
-    expression: SUM(pay_amount)
-    filters:
-      - "order_status != '1'"
-    time_column: created_at
-    time_grain: month
+    description: 月度GMV，按订单创建月归集，排除待支付（order_status≠'1'），不扣退款
+    parts:
+      main:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+    combine: "main"
+
   net_sales_amount:
     display_name: 净销售额
-    description: 月度净销售额 = 当月订单GMV − 当月实际退款额（退款按发生月 refund_date 归集，跨月扣减）
-    base: ods.orders
-    expression: SUM(pay_amount)
-    filters:
-      - "order_status != '1'"
-    time_column: created_at
-    deduction:
-      base: ods.refunds
-      expression: SUM(refund_amount)
-      time_column: refund_date
-    time_grain: month
+    description: 月度净销售额 = 当月GMV − 当月实际退款额（退款按发生月 refund_date 归集，跨月扣减）
+    parts:
+      gmv:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+      refund:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+    combine: "gmv - refund"
+
+  orders_count:
+    display_name: 订单数
+    description: 月度订单数，按订单创建月归集，含全部状态（与 ground_truth monthly.orders 一致）
+    round_digits: 0
+    parts:
+      main:
+        base: orders
+        expression: "COUNT(*)"
+        item_expression: "COUNT(DISTINCT order_items.order_id)"
+        time_column: orders.created_at
+    combine: "main"
+
+  avg_order_value:
+    display_name: 客单价
+    description: 客单价 = 当月GMV / 当月有效订单数（非待支付）
+    parts:
+      gmv:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+      cnt:
+        base: orders
+        expression: "COUNT(DISTINCT orders.order_id)"
+        item_expression: "COUNT(DISTINCT order_items.order_id)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+    combine: "gmv / cnt"
+
+  refund_amount:
+    display_name: 退款额
+    description: 月度退款总额，按退款发生月 refund_date 归集
+    parts:
+      main:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+    combine: "main"
+
+  refund_rate:
+    display_name: 退款率
+    description: 月度退款率 = 当月退款额 / 当月GMV
+    round_digits: 4
+    parts:
+      refund:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+      gmv:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+    combine: "refund / gmv"
+
   repurchase_rate:
     display_name: 复购率
     description: 观察月内近90天窗口[月末−89天,月末]有单用户中「下单≥2个不同日期」的用户占比
-    base: ods.orders
+    round_digits: 4
     window: 90d
     window_anchor: month_end
-    time_grain: month
+
+  marketing_roi:
+    display_name: 营销ROI
+    description: 渠道营销ROI = 归因GMV / 广告花费（ads_daily_stats 按 stat_date 月归集）
+    parts:
+      gmv_attr:
+        base: ads_daily_stats
+        expression: "SUM(ads_daily_stats.attributed_gmv)"
+        time_column: ads_daily_stats.stat_date
+      spend:
+        base: ads_daily_stats
+        expression: "SUM(ads_daily_stats.spend)"
+        time_column: ads_daily_stats.stat_date
+    combine: "gmv_attr / spend"
+
+  net_profit:
+    display_name: 净利润
+    description: 月度净利润 = 净销售额 − COGS（item.qty×cost_price）− 营销花费（口径见 context，无履约费用表）
+    parts:
+      gmv:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+      refund:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+      cogs:
+        base: order_items
+        expression: "SUM(order_items.qty * products.cost_price)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+      spend:
+        base: ads_daily_stats
+        expression: "SUM(ads_daily_stats.spend)"
+        time_column: ads_daily_stats.stat_date
+    combine: "gmv - refund - cogs - spend"
+
+  gross_margin:
+    display_name: 毛利率
+    description: 月度毛利率 = (净销售额 − COGS) / 净销售额
+    round_digits: 4
+    parts:
+      gmv:
+        base: orders
+        expression: "SUM(orders.pay_amount)"
+        item_expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+      refund:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+      cogs:
+        base: order_items
+        expression: "SUM(order_items.qty * products.cost_price)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+    combine: "(gmv - refund - cogs) / (gmv - refund)"
+
+  top_sku_by_net_sales:
+    display_name: TOP-SKU净销额
+    description: 当月净销额最高的 SKU（净销 = 销售额 − 该SKU退款，与 ground_truth top_sku 口径一致）
+    parts:
+      items:
+        base: order_items
+        expression: "SUM(order_items.sale_price * order_items.qty)"
+        filters: ["orders.order_status != '1'"]
+        time_column: orders.created_at
+        group_by: order_items.sku_id
+      refunds_s:
+        base: refunds
+        expression: "SUM(refunds.refund_amount)"
+        time_column: refunds.refund_date
+        group_by: refunds.sku_id
+    combine: "items - refunds_s"
+    rank:
+      group_key: sku_id
+      order: desc
+      limit: 1

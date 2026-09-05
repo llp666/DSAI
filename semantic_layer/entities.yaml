@@ -1,0 +1,29 @@
+# 实体映射：语义层实体 → 物理表 + 主键
+entities:
+  orders:
+    table: ods.orders
+    primary_key: [order_id]
+  order_items:
+    table: ods.order_items
+    primary_key: [order_id, sku_id]
+  products:
+    table: dim.products
+    primary_key: [sku_id]
+  categories:
+    table: dim.categories
+    primary_key: [category_id]
+  users:
+    table: dim.users
+    primary_key: [user_id]
+  refunds:
+    table: ods.refunds
+    primary_key: [refund_id]
+  ads_daily_stats:
+    table: ods.ads_daily_stats
+    primary_key: [campaign_id, stat_date]
+  ads_campaigns:
+    table: dim.ads_campaigns
+    primary_key: [campaign_id]
+  channels:
+    table: dim.channels
+    primary_key: [channel_id]

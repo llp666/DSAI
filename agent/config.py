@@ -42,6 +42,7 @@ class Config:
     duckdb_path: Path
     semantic_layer_path: Path
     meta_dir: Path
+    reference_date: str | None = None
 
 
 def _llm_from_env(prefix: str) -> LLMConfig | None:
@@ -77,6 +78,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
             os.environ.get("SEMANTIC_LAYER_PATH", "semantic_layer/metrics.yaml")
         ),
         meta_dir=Path(os.environ.get("META_DIR", "meta")),
+        reference_date=(os.environ.get("REFERENCE_DATE") or None),
     )
 
 

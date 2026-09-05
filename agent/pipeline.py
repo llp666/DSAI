@@ -15,12 +15,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .compiler import CompileError, compile_query, load_metrics
+from .compiler import CompileError, compile_query
 from .config import Config, load_config, resolve
 from .executor import Executor
 from .llm import LLMClient, build_llm
 from .prompts import build_system_prompt
 from .retriever import Retriever
+from .semantic_layer import load_semantic_layer
 from .tracing import build_tracer
 from .types import AgentState, SemanticQuery
 
@@ -28,7 +29,10 @@ from .types import AgentState, SemanticQuery
 class Pipeline:
     def __init__(self, cfg: Config | None = None):
         self.cfg = cfg or load_config()
-        self.metrics = load_metrics(resolve(self.cfg.semantic_layer_path))
+        self.layer = load_semantic_layer(
+            resolve(self.cfg.semantic_layer_path).parent,
+            resolve(self.cfg.semantic_layer_path).parent / "schema/semantic_layer.schema.json",
+        )
         self.retriever = Retriever(resolve(self.cfg.meta_dir))
         self.executor = Executor(resolve(self.cfg.duckdb_path))
         self.tracer = build_tracer(self.cfg)
@@ -52,7 +56,7 @@ class Pipeline:
 
     def _generate(self, question: str, tables: list[dict], llm: LLMClient,
                   today: str) -> tuple[SemanticQuery | None, str | None, int]:
-        system = build_system_prompt(self.metrics, tables, today)
+        system = build_system_prompt(self.layer, tables, today)
         last_error: str | None = None
         for attempt in range(2):  # 首次 + 重试 1 次
             user = question if attempt == 0 else (
@@ -69,24 +73,43 @@ class Pipeline:
         return None, last_error, 1
 
     # ---------- 回答组装（口径披露） ----------
+    _RATE_METRICS = {"repurchase_rate", "refund_rate", "gross_margin"}
+    _INT_METRICS = {"orders_count"}
+
+    def _format_value(self, metric: str, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if metric in self._RATE_METRICS:
+            return f"{float(value) * 100:.2f}%"
+        if metric in self._INT_METRICS:
+            return f"{float(value):,.0f}"
+        return f"{float(value):,.2f}"
+
+    def _dim_suffix(self, sq: SemanticQuery) -> str:
+        """从维度过滤生成可读后缀，如「服饰品类」「一线城市」。"""
+        display = {n: d["display_name"] for n, d in self.layer.dimensions.items()}
+        parts = []
+        for f in sq.filters:
+            v = f.value if isinstance(f.value, str) else "、".join(f.value)
+            parts.append(f"{v}{display.get(f.dim, f.dim)}")
+        return " · ".join(parts)
+
     def _assemble_answer(self, sq: SemanticQuery, value: Any) -> str:
-        meta = self.metrics[sq.metric]
+        meta = self.layer.metrics[sq.metric]
         ym = sq.window.value
+        suffix = self._dim_suffix(sq)
+        head = f"【{meta['display_name']}】{ym}" + (f" · {suffix}" if suffix else "")
         if value is None:
-            return f"【{meta['display_name']}】{ym} 无数据"
-        if sq.metric == "repurchase_rate":
-            value_text = f"{float(value) * 100:.2f}%"
-        else:
-            value_text = f"{float(value):,.2f}"
+            return f"{head} 无数据"
         return (
-            f"【{meta['display_name']}】{ym} = {value_text}\n"
+            f"{head} = {self._format_value(sq.metric, value)}\n"
             f"口径：{meta['description']}"
         )
 
     # ---------- 主入口 ----------
     def answer(self, question: str, *, use_alt: bool = False) -> dict:
         llm = self._get_llm(use_alt)
-        today = date.today().isoformat()
+        today = self.cfg.reference_date or date.today().isoformat()
         state: AgentState = {
             "question": question,
             "retrieved_tables": [],
@@ -136,7 +159,7 @@ class Pipeline:
             # 3) 编译 SQL
             with t.span("compile") as sp:
                 try:
-                    sql = compile_query(sq, self.metrics)
+                    sql = compile_query(sq, self.layer)
                 except CompileError as e:
                     state["execution_error"] = str(e)
                     state["answer"] = f"编译失败：{e}"

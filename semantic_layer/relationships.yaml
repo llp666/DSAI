@@ -1,0 +1,52 @@
+# 关系图：显式 JOIN 路径 + 基数（编译器 BFS 自动补全 JOIN 的依据）
+# on 为 [左列, 右列] 等值对列表；列引用使用实体别名（= 实体名）
+relationships:
+  order_items_to_orders:
+    left: order_items
+    right: orders
+    "on":
+      - [order_items.order_id, orders.order_id]
+    cardinality: many_to_one
+  order_items_to_products:
+    left: order_items
+    right: products
+    "on":
+      - [order_items.sku_id, products.sku_id]
+    cardinality: many_to_one
+  products_to_categories:
+    left: products
+    right: categories
+    "on":
+      - [products.category_id, categories.category_id]
+    cardinality: many_to_one
+  orders_to_users:
+    left: orders
+    right: users
+    "on":
+      - [orders.user_id, users.user_id]
+    cardinality: many_to_one
+  refunds_to_orders:
+    left: refunds
+    right: orders
+    "on":
+      - [refunds.order_id, orders.order_id]
+    cardinality: many_to_one
+  refunds_to_order_items:
+    left: refunds
+    right: order_items
+    "on":
+      - [refunds.order_id, order_items.order_id]
+      - [refunds.sku_id, order_items.sku_id]
+    cardinality: many_to_one
+  ads_daily_stats_to_ads_campaigns:
+    left: ads_daily_stats
+    right: ads_campaigns
+    "on":
+      - [ads_daily_stats.campaign_id, ads_campaigns.campaign_id]
+    cardinality: many_to_one
+  ads_campaigns_to_channels:
+    left: ads_campaigns
+    right: channels
+    "on":
+      - [ads_campaigns.channel_id, channels.channel_id]
+    cardinality: many_to_one

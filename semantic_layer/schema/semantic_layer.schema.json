@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsai.local/semantic-layer.schema.json",
+  "title": "语义层五区块 Schema",
+  "type": "object",
+  "required": ["entities", "relationships", "metrics", "dimensions", "context"],
+  "properties": {
+    "entities": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z_]+$": {
+          "type": "object",
+          "required": ["table", "primary_key"],
+          "properties": {
+            "table": { "type": "string", "pattern": "^[a-z]+\\.[a-z_]+$" },
+            "primary_key": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "relationships": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z_]+$": {
+          "type": "object",
+          "required": ["left", "right", "on", "cardinality"],
+          "properties": {
+            "left": { "type": "string" },
+            "right": { "type": "string" },
+            "on": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": { "type": "string" }
+              }
+            },
+            "cardinality": {
+              "type": "string",
+              "enum": ["one_to_one", "many_to_one", "one_to_many", "many_to_many"]
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z_]+$": {
+          "type": "object",
+          "required": ["display_name", "description"],
+          "properties": {
+            "display_name": { "type": "string" },
+            "description": { "type": "string" },
+            "parts": {
+              "type": "object",
+              "patternProperties": {
+                "^[a-z_]+$": {
+                  "type": "object",
+                  "required": ["base", "expression", "time_column"],
+                  "properties": {
+                    "base": { "type": "string" },
+                    "expression": { "type": "string" },
+                    "item_expression": { "type": "string" },
+                    "filters": { "type": "array", "items": { "type": "string" } },
+                    "time_column": { "type": "string" },
+                    "group_by": { "type": "string" }
+                  }
+                }
+              }
+            },
+            "combine": { "type": "string" },
+            "window": { "type": "string" },
+            "window_anchor": { "type": "string" },
+            "rank": {
+              "type": "object",
+              "required": ["group_key", "order", "limit"],
+              "properties": {
+                "group_key": { "type": "string" },
+                "order": { "type": "string", "enum": ["asc", "desc"] },
+                "limit": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "dimensions": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z_]+$": {
+          "type": "object",
+          "required": ["display_name", "table", "column", "item_grain", "values"],
+          "properties": {
+            "display_name": { "type": "string" },
+            "table": { "type": "string" },
+            "column": { "type": "string" },
+            "item_grain": { "type": "boolean" },
+            "values": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "required": ["timezone", "visible_data_cutoff"],
+      "properties": {
+        "timezone": { "type": "string" },
+        "visible_data_cutoff": { "type": "string" },
+        "default_calibers": { "type": "object" },
+        "disambiguation": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

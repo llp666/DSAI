@@ -1,0 +1,20 @@
+# context：默认口径、歧义消解策略、时间与数据边界
+context:
+  timezone: Asia/Shanghai
+  visible_data_cutoff: "2026-08-31"
+  default_calibers:
+    gmv: "按订单创建月归集，排除待支付，不扣退款"
+    net_sales_amount: "当月GMV − 按退款发生月归集的退款（跨月扣减）"
+    orders_count: "当月全部订单数（含待支付，与 ground_truth monthly.orders 一致）"
+    avg_order_value: "当月GMV / 当月有效订单数（非待支付）"
+    refund_amount: "按退款发生月归集的退款总额"
+    refund_rate: "当月退款额 / 当月GMV"
+    repurchase_rate: "窗口 [月末−89天,月末] 有单用户中下单≥2个不同日期的占比"
+    marketing_roi: "归因GMV / 广告花费，归因窗口7天点击归因"
+    net_profit: "净销售额 − COGS（item.qty×cost_price）− 营销花费"
+    gross_margin: "(净销售额 − COGS) / 净销售额"
+    top_sku_by_net_sales: "当月净销额最高的 SKU"
+  disambiguation:
+    - "「卖得最好/销售额」默认净销售额；明确说「GMV/成交额（不扣退款）」→ gmv"
+    - "「复购率/回购率」→ repurchase_rate"
+    - "「净利率」→ 无此指标，回退到 gross_margin 并披露差异"
