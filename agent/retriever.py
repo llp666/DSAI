@@ -28,9 +28,12 @@ DOMAIN_TERMS = {
     "补货": ["purchase_order"], "在途": ["purchase_order"], "供应商": ["supplier"],
     "入库": ["inbound"], "仓库": ["warehouse"], "动销": ["stock_moves", "order_items"],
     "退货": ["refund"], "净销售额": ["order", "refund"], "毛利": ["order_items", "product"],
-    "促销": ["promo"], "大促": ["promo"], "618": ["promo", "order"],
+    "促销": ["promo"], "大促": ["promo", "order"], "618": ["promo", "order"],
+    "销量": ["order_items", "order"], "成交额": ["order"],
     "时间": ["dim_date"], "季度": ["dim_date", "order"], "城市": ["user"],
 }
+# 问题含这些词 → 订单表强召回（score 再加 3，伪 rank 1）
+ORDER_FORCE_WORDS = ("复购", "净销售额", "销量", "卖得最好", "大促", "GMV", "成交额", "毛利")
 
 
 # 真实数据表白名单（31 张，meta/table_docs.json 中非 catalog 的真实表）
@@ -73,6 +76,9 @@ def _keyword_rank(question: str, doc: dict) -> float:
                     score += 3.0 if k in ("order", "refund") else 2.0
                 elif k in desc:
                     score += 1.0
+    # 订单强相关词：orders 表（表名含 order）额外 +3 → 必进 Top-1
+    if any(w.lower() in q for w in ORDER_FORCE_WORDS) and "order" in table_name.lower():
+        score += 3.0
     # 表名直接包含问题里的英文词（如 sku_id）加分
     for word in re.findall(r"[a-z_]+", q):
         if word in table_name.lower():
@@ -82,14 +88,14 @@ def _keyword_rank(question: str, doc: dict) -> float:
 
 def _rrf_fuse(vector_ranks: dict[str, int], keyword_scores: dict[str, float],
               k: int = 60) -> list[str]:
-    """RRF 融合：Σ 1/(k+rank) 按向量排序 + 关键词加权（作为伪 rank）。"""
+    """RRF 融合：向量排序 + 关键词加权（关键词强命中 → 高伪 rank，接近 Top-1）。"""
     fused: dict[str, float] = {}
     for tid, rank in vector_ranks.items():
         fused[tid] = fused.get(tid, 0.0) + 1.0 / (k + rank)
     for tid, score in keyword_scores.items():
         if score > 0:
-            # 关键词命中：按分数折算伪 rank（分数越高 rank 越前，加成越大）
-            pseudo_rank = max(1, 60 - int(score * 10))
+            # 关键词分 ≥3 → 伪 rank 3-5（强信号，接近向量 Top-1）；分低 → rank 8+
+            pseudo_rank = max(1, 8 - int(score))
             fused[tid] = fused.get(tid, 0.0) + 1.0 / (k + pseudo_rank)
     return sorted(fused, key=fused.get, reverse=True)
 
