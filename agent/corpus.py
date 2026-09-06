@@ -15,6 +15,7 @@ from jsonschema import validate
 from jsonschema.exceptions import ValidationError as JsValidationError
 
 from .config import resolve
+from .tables import has_data
 
 
 class CorpusError(RuntimeError):
@@ -61,7 +62,8 @@ def build_corpus(meta_dir: Path, scenarios_path: Path,
             "doc_type": "table",
             "domain": doc.get("domain", ""),
             "document": _render_table(doc),
-            "metadata": {"updated_at": updated_at, "tables": [key]},
+            "metadata": {"updated_at": updated_at, "tables": [key],
+                         "has_data": has_data(key)},
         }
         entries.append(entry)
     for sc in scenarios:
@@ -73,6 +75,7 @@ def build_corpus(meta_dir: Path, scenarios_path: Path,
             "metadata": {
                 "updated_at": updated_at,
                 "tables": sc.get("involved_tables", []),
+                "has_data": True,  # 场景卡涉及真实表
             },
         }
         entries.append(entry)

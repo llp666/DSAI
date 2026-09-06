@@ -14,6 +14,8 @@ import json
 import re
 from pathlib import Path
 
+from .tables import has_data
+
 # 阶段一硬编码 Top-3（月度 GMV/净销/复购率评测所需表）
 TOP3_KEYS = ["ods.orders", "ods.order_items", "ods.refunds"]
 
@@ -36,24 +38,9 @@ DOMAIN_TERMS = {
 ORDER_FORCE_WORDS = ("复购", "净销售额", "销量", "卖得最好", "大促", "GMV", "成交额", "毛利")
 
 
-# 真实数据表白名单（31 张，meta/table_docs.json 中非 catalog 的真实表）
-REAL_TABLES = {
-    "dim.dim_date", "dim.categories", "dim.products", "dim.users",
-    "dim.channels", "dim.ads_campaigns", "dim.promotions", "dim.suppliers",
-    "dim.warehouses", "dim.festival_calendar",
-    "ods.orders", "ods.order_items", "ods.refunds", "ods.order_payments",
-    "ods.order_status_log", "ods.ads_daily_stats", "ods.ad_conversions",
-    "ods.purchase_orders", "ods.purchase_order_items", "ods.inventory_snapshot",
-    "ods.warehouse_stock", "ods.inbound_records", "ods.stock_moves",
-    "ods.traffic_events", "ods.product_price_log", "ods.coupons",
-    "ods.order_coupons", "ods.user_profiles", "ods.user_level_log",
-    "ods.after_sales", "ods.search_logs",
-}
-
-
 def _is_catalog(table: str) -> bool:
-    """catalog 表：不在真实表白名单内（datagen 模板池生成，0 行空表）。"""
-    return table not in REAL_TABLES
+    """catalog 表：无数据（has_data=False，datagen 模板池生成 0 行空表）。"""
+    return not has_data(table)
 
 
 def _keyword_rank(question: str, doc: dict) -> float:
