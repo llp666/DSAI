@@ -15,11 +15,15 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -32,6 +36,9 @@ from .types import AgentState, SemanticQuery
 # 检索注入 Token 预算（agnes maxInput 128k 的 1/8，预留指令/回答余量）
 RETRIEVAL_BUDGET = 16000
 MAX_RETRIES = 2
+# 递归上限：主链 5 步 + 每轮 repair 5 步 × (MAX_RETRIES+1) + 余量。超限抛 GraphRecursionError，
+# 由 answer() 捕获降级而非静默截断（配合 checkpointer 在 Langfuse 看完整路径）
+RECURSION_LIMIT = 5 * (MAX_RETRIES + 1) + 5
 
 
 class _NullCtx:
@@ -78,6 +85,7 @@ class DsaiGraph:
         self._reranker = pipeline._reranker
         self._t = None  # 当前 trace session（answer() 入口设置，节点 span 用）
         self._use_alt = False
+        self._checkpointer = MemorySaver()
         self._build_tools()
         self._graph = self._build_graph()
 
@@ -106,13 +114,14 @@ class DsaiGraph:
 
         @tool
         def execute_tool(sql: str) -> str:
-            """执行只读 SQL，返回首行首列结果（JSON 序列化保类型）。"""
+            """执行只读 SQL，返回首行首列结果（JSON 序列化，Decimal→float 保类型）。"""
             try:
                 rows = executor.execute(sql)
             except Exception as e:
                 raise RuntimeError(f"SQL 执行失败: {e}") from e
             value = rows[0][0] if rows else None
-            return json.dumps(value, ensure_ascii=False, default=str)
+            return json.dumps(value, ensure_ascii=False,
+                              default=lambda o: float(o) if isinstance(o, Decimal) else str(o))
 
         self._tools = [compile_tool, dry_run_tool, execute_tool]
         self._tool_node = ToolNode(self._tools, handle_tool_errors=True)
@@ -294,7 +303,7 @@ class DsaiGraph:
         g.add_edge("repair", "reflect")
         g.add_edge("reflect", "generate")
         g.add_edge("answer", END)
-        return g.compile()
+        return g.compile(checkpointer=self._checkpointer)
 
     # ---------- 入口 ----------
 
@@ -322,8 +331,23 @@ class DsaiGraph:
             self._t = t
             self._use_alt = use_alt
             t.set_trace_io(input={"question": question})
+            config = {
+                "configurable": {
+                    "thread_id": f"{uuid.uuid4().hex[:12]}",  # 每问独立会话，checkpointer 存档
+                },
+                "recursion_limit": RECURSION_LIMIT,
+            }
             try:
-                final = self._graph.invoke(state)
+                final = self._graph.invoke(state, config)
+            except GraphRecursionError as e:
+                # 递归超限不静默：记录真实错误并降级回答（Langfuse 已含此前各节点 span）
+                err = f"递归深度超限（{RECURSION_LIMIT} 步，可能纠错循环未收敛）: {e}"
+                final = dict(state)
+                final["execution_error"] = err
+                final["errors"] = list(final.get("errors", [])) + [err]
+                final["answer"] = f"无法回答：{err}"
+                with self._span("judge", output={"stage": "degrade", "recursion_exceeded": True}):
+                    final["stage"] = "degrade"
             finally:
                 self._t = None
         final["trace_id"] = t.trace_id
