@@ -25,6 +25,7 @@ from .semantic_layer import (
 from .types import DimensionFilter, SemanticQuery
 
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ALIAS_RE = re.compile(r"\b([a-z_][a-z_0-9]*)\.", re.ASCII)
 
 
@@ -40,6 +41,24 @@ def _month_bounds(ym: str) -> tuple[str, str]:
         raise CompileError(f"非法月份：{ym!r}")
     last = calendar.monthrange(year, month)[1]
     return f"{ym}-01", f"{ym}-{last:02d}"
+
+
+def _day_bounds(d: str) -> tuple[str, str]:
+    if not DAY_RE.match(d):
+        raise CompileError(f"非法日期格式：{d!r}（应为 YYYY-MM-DD）")
+    try:
+        date.fromisoformat(d)
+    except ValueError as e:
+        raise CompileError(f"非法日期：{d!r}") from e
+    return d, d
+
+
+def _bounds_for(win_type: str, value: str) -> tuple[str, str]:
+    if win_type == "month":
+        return _month_bounds(value)
+    if win_type == "day":
+        return _day_bounds(value)
+    raise CompileError(f"不支持的窗口类型：{win_type!r}（应为 month 或 day）")
 
 
 def _window_bounds(ym: str) -> tuple[str, str]:
@@ -142,7 +161,7 @@ def _build_part_cte(layer: SemanticLayer, name: str, part: dict,
 
 def _compile_parts(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                    dims: list[tuple[str, dict]], fan_out: bool) -> str:
-    start, end = _month_bounds(sq.window.value)
+    start, end = _bounds_for(sq.window.type, sq.window.value)
     part_names = list(meta["parts"].keys())
     ctes = [_build_part_cte(layer, n, meta["parts"][n], dims, sq.filters,
                             start, end, fan_out) for n in part_names]
@@ -159,6 +178,9 @@ def _compile_parts(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
 
 def _compile_window(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                     dims: list[tuple[str, dict]]) -> str:
+    # 窗口指标（复购率等）的 90 天滚动窗口锚定月末，日窗口无意义 → 守卫拒绝
+    if sq.window.type != "month":
+        raise CompileError(f"窗口指标 {sq.metric} 仅支持月窗口，不支持 {sq.window.type} 窗口")
     w_start, w_end = _window_bounds(sq.window.value)
     base = "orders"
     required = {d["table"] for _, d in dims} - {base}
@@ -186,7 +208,7 @@ SELECT COALESCE(round(
 
 def _compile_rank(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                   dims: list[tuple[str, dict]], fan_out: bool) -> str:
-    start, end = _month_bounds(sq.window.value)
+    start, end = _bounds_for(sq.window.type, sq.window.value)
     gk = meta["rank"]["group_key"]
     part_names = list(meta["parts"].keys())
     ctes = [_build_part_cte(layer, n, meta["parts"][n], dims, sq.filters,
@@ -204,6 +226,62 @@ SELECT p_{part_names[0]}.{gk} AS result
 FROM {joins}
 ORDER BY ({qualified}) {order}
 LIMIT {limit}
+""".strip()
+
+
+def _compile_snapshot(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
+                      dims: list[tuple[str, dict]]) -> str:
+    """kind=snapshot 指标：按快照时点做点查（如期末断货 SKU 数）。
+
+    meta 需带 snapshot 配置：
+      entity:  快照实体名（如 inventory_snapshot）
+      when:    value 取值（'end'=取窗口末日的快照 / 'latest'=取窗口内最新快照）
+      cond:    WHERE 条件（引用实体别名，如 "inventory_snapshot.on_hand_qty = 0"）
+      count_col / count_distinct: 计数方式（默认 count(*)）
+    只支持日窗口或单月（快照按日期点查）。
+    """
+    snap = meta.get("snapshot", {})
+    entity = snap.get("entity")
+    if not entity:
+        raise CompileError(f"快照指标 {sq.metric} 缺少 snapshot.entity 配置")
+    cond = snap.get("cond")
+    if not cond:
+        raise CompileError(f"快照指标 {sq.metric} 缺少 snapshot.cond 配置")
+
+    # 维度可达性：快照实体必须能 JOIN 到维度表（如按品类统计断货）
+    dim_tables = {d["table"] for _, d in dims}
+    try:
+        chain = build_join_chain(layer.graph, entity, dim_tables)
+    except SemanticLayerError as e:
+        raise CompileError(f"快照指标 {sq.metric} 不支持维度：{e}")
+    from_clause = _build_from(layer, entity, chain)
+
+    # 时点解析：日窗口取当日快照；月窗口取窗口内末日最近快照
+    start, end = _bounds_for(sq.window.type, sq.window.value)
+    snap_table = layer.resolve_table(entity)
+    if sq.window.type == "day":
+        date_cond = f"({entity}.snapshot_date = DATE '{start}')"
+        # 快照存在性：该日无快照 → HAVING 过滤聚合组 → 空结果（触发 reflect_empty）
+        exist_cond = f"(SELECT count(*) FROM {snap_table} WHERE snapshot_date = DATE '{start}')"
+    else:
+        # 月窗口：取 <= 窗口末日的最近一个快照日（快照周粒度，避免多快照重复计数）
+        date_cond = (f"({entity}.snapshot_date = ("
+                     f"SELECT max(snapshot_date) FROM {snap_table} "
+                     f"WHERE snapshot_date::DATE <= DATE '{end}'))")
+        exist_cond = f"(SELECT count(*) FROM {snap_table} WHERE snapshot_date::DATE <= DATE '{end}')"
+    conds = [date_cond]
+    conds.append(f"({cond})")
+    conds += [_dim_cond(d, f) for f in sq.filters if (d := dict(dims)[f.dim])]
+    where = " AND ".join(conds)
+
+    inner = f"count(DISTINCT {entity}.{snap.get('count_col', 'sku_id')})"
+    rd = meta.get("round_digits", 0)
+    # HAVING 快照存在性：无快照（时点无数据）→ 聚合组被过滤 → 返回空结果（诚实，不静默 0）
+    return f"""
+SELECT COALESCE(round({inner}::DOUBLE, {rd}), 0) AS result
+FROM {from_clause}
+WHERE {where}
+HAVING {exist_cond} > 0
 """.strip()
 
 
@@ -228,6 +306,8 @@ def _compile_query(sq: SemanticQuery, layer: SemanticLayer) -> str:
         sql = _compile_window(layer, sq, meta, dims)
     elif "rank" in meta:
         sql = _compile_rank(layer, sq, meta, dims, fan_out)
+    elif meta.get("kind") == "snapshot":
+        sql = _compile_snapshot(layer, sq, meta, dims)
     else:
         sql = _compile_parts(layer, sq, meta, dims, fan_out)
 

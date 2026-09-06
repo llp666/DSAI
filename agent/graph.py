@@ -29,6 +29,8 @@ from langgraph.prebuilt import ToolNode
 
 from .compiler import CompileError, compile_query
 from .error_classifier import build_repair_prompt, classify_error, format_available_dimensions
+from .monitor import BudgetExceeded
+from .preflight import preflight
 from .prompt_budget import render_tables_budgeted
 from .relevance import check_relevance
 from .rewrite import rewrite
@@ -83,6 +85,44 @@ def _parse_result(res: str):
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], list) and len(rows[0]) == 1:
         return rows[0][0]
     return rows
+
+
+def _is_empty(result) -> bool:
+    """空结果判定：None 或空列表（rank/snapshot 类指标无数据时返回 []）。"""
+    return result is None or (isinstance(result, list) and len(result) == 0)
+
+
+def _parse_reflect_empty(raw: str) -> dict:
+    """解析 reflect_empty 的 LLM 输出：{"action": "confirm"|"relax", "reason": "..."}。
+
+    只接受 confirm/relax 二选一，不接受 LLM 提供的 new_window——
+    放宽窗口是确定性的（见 reflect_empty_node），防止 LLM 为出数悄悄改口径。
+    """
+    import re as _re
+
+    text = raw.strip()
+    m = _re.search(r"```(?:json)?\s*(.*?)\s*```", text, _re.S)
+    if m:
+        text = m.group(1)
+    data = json.loads(text)
+    action = data.get("action")
+    if action not in ("confirm", "relax"):
+        raise ValueError(f"reflect_empty 动作非法：{action!r}")
+    return {"action": action, "reason": data.get("reason", "")}
+
+
+def _relax_window(sq: SemanticQuery) -> SemanticQuery | None:
+    """确定性放宽窗口：单日 → 该日所在月；month 已最宽 → 返回 None（不放宽）。
+
+    放宽是确定性规则而非 LLM 自选，杜绝「为出数悄悄改口径」——
+    只允许「单日查空 → 看当月整体」这一种合理放宽，且保持 metric/dimensions/filters 不变。
+    """
+    if sq.window.type == "month":
+        return None
+    month = sq.window.value[:7]  # YYYY-MM-DD → YYYY-MM
+    data = sq.model_dump()
+    data["window"] = {"type": "month", "value": month}
+    return SemanticQuery.model_validate(data)
 
 
 class DsaiGraph:
@@ -201,6 +241,8 @@ class DsaiGraph:
                             "请根据错误原因修正你的语义查询 JSON，只输出合法 JSON。")
             try:
                 sq, raw, attempts = self.p._generate(question, state["schema_text"], llm, today)
+            except BudgetExceeded:
+                raise  # 熔断：透传让 answer 捕获降级，不吞成普通失败
             except Exception as e:
                 return {"semantic_query": None, "execution_error": f"LLM 调用失败: {e}"}
             return {"semantic_query": sq, "execution_error": None}
@@ -235,35 +277,100 @@ class DsaiGraph:
             return {**upd, "errors": errors, "messages": msgs[start:]}
 
     def validate_node(self, state: AgentState) -> dict:
-        """相关性/意图校验：DSL 外实体 → hallucination（降级）；粒度错位 → intent_mismatch（repair 修复）。"""
+        """前置校验（编译前）：四层预检 + 相关性/意图校验。
+
+        预检（preflight）：日期边界/枚举字典/粒度回退/时效 cutoff——确定性拦截可预见的失败；
+        相关性（check_relevance）：DSL 外实体 → hallucination（降级）；粒度错位 → intent_mismatch（repair）。
+        全部通过才进 tools 编译执行，避免无效 LLM 重试与无效编译。
+        """
         q = state.get("question", "")
         sq = state.get("semantic_query")
         if sq is None:
-            return {"hallucination": False, "intent_mismatch": False}
-        verdict = check_relevance(q, sq.metric, sq.dimensions, sq.filters)
-        with self._span("validate", output={"kind": verdict.kind,
-                                            "reason": verdict.reason}):
-            if verdict.kind == "hallucination":
-                return {"hallucination": True, "intent_mismatch": False,
-                        "execution_error": verdict.reason}
-            if verdict.kind == "granularity":
+            return {"hallucination": False, "intent_mismatch": False,
+                    "preflight_kind": "pass", "preflight_reason": ""}
+        # 第一层：四层预检（确定性，零 LLM）
+        cutoff = self.layer.context.get("visible_data_cutoff")
+        try:
+            verdict = preflight(sq, self.layer, cutoff=cutoff)
+        except Exception as e:
+            # 预检异常不崩溃：降级拦截（诚实告知），交由降级回答
+            return {"hallucination": False, "intent_mismatch": False,
+                    "preflight_kind": "cutoff",
+                    "preflight_reason": f"预检异常：{e}",
+                    "execution_error": f"预检异常：{e}"}
+        if not verdict.ok:
+            with self._span("validate", output={"kind": verdict.kind,
+                                                "reason": verdict.reason[:120]}):
+                if verdict.kind == "cutoff":
+                    # 窗口超出可见数据截止：拦截降级（不静默查空）
+                    return {"hallucination": False, "intent_mismatch": False,
+                            "preflight_kind": "cutoff",
+                            "preflight_reason": verdict.reason,
+                            "execution_error": verdict.reason}
+                if verdict.kind == "granularity":
+                    # 维度/指标组合非法：回灌修复（repair 轨）
+                    return {"hallucination": False, "intent_mismatch": True,
+                            "preflight_kind": "granularity",
+                            "preflight_reason": verdict.reason,
+                            "error_feedback": verdict.reason + " " + verdict.suggestion}
+                # date / enum：值/格式非法 → 回灌修复
                 return {"hallucination": False, "intent_mismatch": True,
-                        "error_feedback": verdict.reason}
-            return {"hallucination": False, "intent_mismatch": False}
+                        "preflight_kind": verdict.kind,
+                        "preflight_reason": verdict.reason,
+                        "error_feedback": verdict.reason + " " + verdict.suggestion}
+        # 第二层：相关性/意图校验
+        rel = check_relevance(q, sq.metric, sq.dimensions, sq.filters)
+        with self._span("validate", output={"kind": rel.kind,
+                                            "reason": rel.reason}):
+            if rel.kind == "hallucination":
+                return {"hallucination": True, "intent_mismatch": False,
+                        "preflight_kind": "pass", "preflight_reason": "",
+                        "execution_error": rel.reason}
+            if rel.kind == "granularity":
+                return {"hallucination": False, "intent_mismatch": True,
+                        "preflight_kind": "pass", "preflight_reason": "",
+                        "error_feedback": rel.reason}
+            return {"hallucination": False, "intent_mismatch": False,
+                    "preflight_kind": "pass", "preflight_reason": ""}
 
     def judge_node(self, state: AgentState) -> dict:
-        """judge 图节点：记录判定结果供 trace（条件路由在 _judge_cond）。"""
+        """judge 图节点（validate 后·编译前）：预检/相关性判定，供条件路由。"""
+        stage = self._judge_pre_cond(state)
+        with self._span("judge", output={"stage": stage,
+                                         "preflight": state.get("preflight_kind")}):
+            return {"stage": stage}
+
+    def judge_post_node(self, state: AgentState) -> dict:
+        """judge 图节点（tools 后·编译执行后）：执行结果判定。"""
         stage = self._judge_cond(state)
         with self._span("judge", output={"stage": stage,
                                          "n_errors": len(state.get("errors", []))}):
             return {"stage": stage}
 
-    def _judge_cond(self, state: AgentState) -> Literal["answer", "repair", "degrade"]:
-        """判定优先级：幻觉→degrade；粒度错位→repair；成功→answer；生成失败→degrade；重试耗尽→degrade；有错→repair。"""
+    def _judge_pre_cond(self, state: AgentState) -> Literal["answer", "repair", "tools"]:
+        """validate 后（编译前）路由：幻觉/预检 cutoff → 降级；粒度错位/预检可修 → repair；通过 → tools。"""
+        if state.get("hallucination"):
+            return "answer"
+        if state.get("preflight_kind") == "cutoff":
+            return "answer"
+        if state.get("intent_mismatch") or state.get("preflight_kind") in ("date", "enum", "granularity"):
+            return "repair"
+        return "tools"
+
+    def _judge_cond(self, state: AgentState) -> Literal["answer", "repair", "degrade", "reflect_empty"]:
+        """tools 后（编译执行后）判定优先级：
+        幻觉→degrade；执行过返回空列表且未放宽→reflect_empty；粒度错位→repair；
+        成功→answer；生成失败→degrade；重试耗尽→degrade；有错→repair。"""
         if state.get("hallucination"):
             return "degrade"
         if state.get("intent_mismatch") and state.get("retry_count", 0) < state.get("max_retries", MAX_RETRIES):
             return "repair"
+        # 空结果反思：仅当「执行过且返回空列表」且未放宽过才触发（None=未执行，走后续判定）
+        if isinstance(state.get("execution_result"), list) \
+                and len(state.get("execution_result")) == 0:
+            if not state.get("_relaxed") and state.get("relax_attempts", 0) < MAX_RETRIES:
+                return "reflect_empty"
+            return "answer"
         if state.get("execution_result") is not None:
             return "answer"
         if state.get("semantic_query") is None:
@@ -298,6 +405,62 @@ class DsaiGraph:
                 "retry_count": state.get("retry_count", 0) + 1,
             }
 
+    def reflect_empty_node(self, state: AgentState) -> dict:
+        """空结果反思：查询执行返回空结果（[]）时，让 LLM 判定是真无数据还是窗口可放宽。
+
+        返回两种动作：
+        - relax：确定性放宽窗口（单日 → 该日所在月）重查，设 _relaxed 重查。
+          放宽是确定性规则而非 LLM 自选窗口，杜绝「为出数悄悄改口径」——
+          LLM 只判二选一，不提供 new_window。
+        - confirm：确认该窗口确实无数据 → 诚实降级（answer 渲染「无数据」，不猜测填充）
+        """
+        sq = state.get("semantic_query")
+        if sq is None:
+            # 无语义查询却空结果：直接诚实降级（不反思）
+            return {"empty_result": True, "error_feedback": "无有效语义查询，按确认无数据降级"}
+        with self._span("reflect_empty", input={"metric": sq.metric,
+                                                "window": sq.window.value,
+                                                "empty_result": True}):
+            llm = self.p._get_llm(self._use_alt)
+            system = (
+                "你是电商数据分析 Agent 的空结果反思器。用户查询的语义查询执行后返回空结果（无匹配数据）。"
+                "请判断这是「该窗口确实无数据（confirm）」还是「窗口过窄导致查空（relax）」。\n\n"
+                "只输出合法 JSON，格式：\n"
+                '{"action": "confirm"|"relax", "reason": "判断理由（<50字）"}\n'
+                "注意：不要为了给出数字而放宽口径——放宽策略是确定的（单日→所在月），你只负责判定方向。"
+            )
+            user = (
+                f"问题：{state['question']}\n"
+                f"指标：{sq.metric}（{self.layer.metrics[sq.metric]['display_name']}）\n"
+                f"窗口：{sq.window.type} {sq.window.value}\n"
+                f"数据截止：{self.layer.context.get('visible_data_cutoff', '未知')}\n"
+                "查询执行返回空结果。请判定 confirm 或 relax。"
+            )
+            try:
+                raw = llm.complete(system, user)
+                decision = _parse_reflect_empty(raw)
+                if decision["action"] == "relax":
+                    new_sq = _relax_window(sq)
+                    if new_sq is None:
+                        # 月窗口已是最宽语义，不放宽 → 确认无数据
+                        return {"empty_result": True,
+                                "error_feedback": f"空结果反思：{sq.window.type} 窗口已最宽，确认无数据（{decision.get('reason', '')}）"}
+                    return {"semantic_query": new_sq, "_relaxed": True,
+                            "_reflect_fixed": True,  # 透传 new_sq 直接重编译，不让 LLM 覆盖
+                            "relax_attempts": state.get("relax_attempts", 0) + 1,
+                            "execution_result": None,
+                            "empty_result": False,
+                            "error_feedback": f"空结果反思：窗口放宽到 {new_sq.window.value}（{decision.get('reason', '')}）"}
+                # confirm：确认无数据，诚实降级
+                return {"empty_result": True,
+                        "error_feedback": f"空结果反思确认：{decision.get('reason', '该窗口无数据')}"}
+            except BudgetExceeded:
+                raise  # 熔断：透传给 answer 降级
+            except Exception as e:
+                # 反思失败：不猜测，诚实降级
+                return {"empty_result": True,
+                        "error_feedback": f"空结果反思失败（{e}），按确认无数据降级"}
+
     def reflect_node(self, state: AgentState) -> dict:
         """按错误类型反思：粒度错位→回灌补维度；引用/逻辑/方言→LLM 重写语义查询 JSON。"""
         categories = state.get("error_categories", [])
@@ -322,6 +485,8 @@ class DsaiGraph:
                     return {"semantic_query": sq, "_reflect_fixed": True,
                             "intent_mismatch": False,
                             "error_feedback": feedback + "\n（已补维度重写）"}
+                except BudgetExceeded:
+                    raise  # 熔断：透传给 answer 降级
                 except Exception:
                     return {"intent_mismatch": False,
                             "error_feedback": feedback + "\n（补维度重写失败，降级）"}
@@ -341,6 +506,8 @@ class DsaiGraph:
                 # 重写成功：标记跳过 generate，直接进 tools 用修复后的语义查询重编译验证
                 return {"semantic_query": sq, "_reflect_fixed": True,
                         "error_feedback": feedback + "\n（已重写语义查询）"}
+            except BudgetExceeded:
+                raise  # 熔断：透传给 answer 降级
             except Exception:
                 # 重写失败：保留原错误反馈，让 generate 自行尝试修正
                 return {"error_feedback": feedback}
@@ -348,12 +515,30 @@ class DsaiGraph:
     def answer_node(self, state: AgentState) -> dict:
         with self._span("answer", output={"stage": state.get("stage")}):
             sq = state.get("semantic_query")
+            # 空结果（执行过返回空列表，且无执行错误）：诚实渲染「无数据」，不猜测填充
+            empty = isinstance(state.get("execution_result"), list) \
+                and len(state.get("execution_result")) == 0
+            if not state.get("execution_error") and (state.get("empty_result") or empty):
+                reason = state.get("error_feedback", "")
+                window = sq.window.value if sq else ""
+                relaxed_note = ("（已尝试放宽窗口，仍无数据）"
+                                if state.get("_relaxed") else "（经空结果反思确认）")
+                return {"answer": (
+                    f"【{self.layer.metrics[sq.metric]['display_name'] if sq else '指标'}】"
+                    f"{window} 无数据 {relaxed_note}\n"
+                    f"{reason}\n"
+                    "说明：查询如实执行，未做数据猜测或填充。")}
             # 正常完成：语义查询有效且无错误（execution_result 可为 None=无数据，_assemble_answer 处理）
             if sq is not None and not state.get("errors") and not state.get("execution_error") \
                     and not state.get("hallucination"):
                 answer = self.p._assemble_answer(
                     sq, state.get("execution_result"),
                     state["retrieved_tables"], state.get("compiled_sql"))
+                # ②灵魂风险：放宽口径出数必须披露——单日查空放宽到当月拿到数时，答案明示口径变化
+                if state.get("_relaxed"):
+                    note = state.get("error_feedback", "")
+                    answer = (f"{answer}\n\n⚠ 口径说明：原始单日窗口无数据，"
+                              f"已将窗口放宽到 {sq.window.value} 后给出当月数据。\n{note}")
                 return {"answer": answer}
             # 幻觉拦截：明确提示问题超出可答范围（意图错位），不返回错数据
             if state.get("hallucination"):
@@ -363,6 +548,12 @@ class DsaiGraph:
                     f"无法回答：该问题超出了当前可查询范围。\n"
                     f"原因：{hint}\n"
                     "建议：改为按月份/品类/渠道/城市等维度查询聚合指标（GMV/订单数/退款率等）。")}
+            # 时效 cutoff 拦截：数据未到可见边界，诚实说明而非静默查空
+            if state.get("preflight_kind") == "cutoff":
+                return {"answer": (
+                    f"无法回答：查询窗口超出数据可见范围。\n"
+                    f"原因：{state.get('preflight_reason') or state.get('execution_error', '')}\n"
+                    "说明：数据仅更新到可见截止日，之后窗口无数据可查，不做猜测填充。")}
             # 降级：明确提示 + 已试 SQL + 错误摘要 + 建议人工介入
             err = (state.get("execution_error")
                    or (state["errors"][-1] if state.get("errors") else "未知错误"))
@@ -382,6 +573,12 @@ class DsaiGraph:
 
     # ---------- 图构建 ----------
 
+    def _reflect_empty_cond(self, state: AgentState) -> Literal["generate", "answer"]:
+        """reflect_empty 后路由：已放宽窗口 → 重查；confirm → 诚实降级回答。"""
+        if state.get("_relaxed") and not state.get("empty_result"):
+            return "generate"
+        return "answer"
+
     def _build_graph(self):
         g = StateGraph(AgentState)
         g.add_node("intent", self.intent_node)
@@ -389,23 +586,35 @@ class DsaiGraph:
         g.add_node("generate", self.generate_node)
         g.add_node("tools", self.tools_node)
         g.add_node("validate", self.validate_node)
-        g.add_node("judge", self.judge_node)
+        g.add_node("judge", self.judge_node)            # 编译前（validate 后）
+        g.add_node("judge_post", self.judge_post_node)  # 编译后（tools 后）
         g.add_node("repair", self.repair_node)
         g.add_node("reflect", self.reflect_node)
+        g.add_node("reflect_empty", self.reflect_empty_node)
         g.add_node("answer", self.answer_node)
 
         g.add_edge(START, "intent")
         g.add_edge("intent", "retrieve")
         g.add_edge("retrieve", "generate")
-        g.add_edge("generate", "tools")
-        g.add_edge("tools", "validate")
+        # validate 前置到编译前：预检/相关性拦截后再进 tools
+        g.add_edge("generate", "validate")
         g.add_edge("validate", "judge")
         g.add_conditional_edges(
-            "judge", self._judge_cond,
-            {"answer": "answer", "repair": "repair", "degrade": "answer"},
+            "judge", self._judge_pre_cond,
+            {"answer": "answer", "repair": "repair", "tools": "tools"},
+        )
+        g.add_edge("tools", "judge_post")
+        g.add_conditional_edges(
+            "judge_post", self._judge_cond,
+            {"answer": "answer", "repair": "repair",
+             "reflect_empty": "reflect_empty", "degrade": "answer"},
         )
         g.add_edge("repair", "reflect")
         g.add_edge("reflect", "generate")
+        g.add_conditional_edges(
+            "reflect_empty", self._reflect_empty_cond,
+            {"generate": "generate", "answer": "answer"},
+        )
         g.add_edge("answer", END)
         return g.compile(checkpointer=self._checkpointer)
 
@@ -419,6 +628,11 @@ class DsaiGraph:
             "stage": "",
             "hallucination": False,
             "intent_mismatch": False,
+            "preflight_kind": "pass",
+            "preflight_reason": "",
+            "empty_result": False,
+            "_relaxed": False,
+            "relax_attempts": 0,
             "schema_text": "",
             "retrieved_tables": [],
             "_retrieve_degraded": False,
@@ -447,8 +661,23 @@ class DsaiGraph:
                 },
                 "recursion_limit": RECURSION_LIMIT,
             }
+            monitor = self.p.begin_question()  # 三层熔断：轮次/token/超时
+            final = dict(state)  # 兜底：任何异常路径下 finally 均可安全访问
             try:
                 final = self._graph.invoke(state, config)
+            except BudgetExceeded as e:
+                # 预算熔断：诚实告知预算耗尽，不静默截断（trace 已含此前各节点 span）
+                err = f"单问预算耗尽被熔断：{e}"
+                final = dict(state)
+                final["execution_error"] = err
+                final["errors"] = list(final.get("errors", [])) + [err]
+                final["budget_exceeded"] = {"reason": e.reason, "used": e.used,
+                                            "limit": e.limit}
+                final["answer"] = (
+                    f"无法回答：处理该问题超出预算上限（{e.reason}，已用 {e.used}，上限 {e.limit}）。\n"
+                    "建议：缩小问题范围（如改为月粒度/减少追问轮次）后重试。")
+                with self._span("judge", output={"stage": "degrade", "budget_exceeded": True}):
+                    final["stage"] = "degrade"
             except GraphRecursionError as e:
                 # 递归超限不静默：记录真实错误并降级回答（Langfuse 已含此前各节点 span）
                 err = f"递归深度超限（{RECURSION_LIMIT} 步，可能纠错循环未收敛）: {e}"
@@ -459,6 +688,8 @@ class DsaiGraph:
                 with self._span("judge", output={"stage": "degrade", "recursion_exceeded": True}):
                     final["stage"] = "degrade"
             finally:
+                final.setdefault("budget", monitor.snapshot())  # _timed：预算快照进 final
+                self.p.end_question()
                 self._t = None
         final["trace_id"] = t.trace_id
         return final

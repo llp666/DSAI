@@ -176,3 +176,12 @@ metrics:
       group_key: sku_id
       order: desc
       limit: 1
+
+  stockout_skus_count:
+    display_name: 断货SKU数
+    description: 期末快照中 on_hand_qty=0（断货）的 SKU 数；日窗口取当日快照，月窗口取窗口内末日最近快照
+    round_digits: 0
+    kind: snapshot
+    snapshot:
+      entity: inventory_snapshot
+      cond: "inventory_snapshot.on_hand_qty = 0"

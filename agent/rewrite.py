@@ -19,9 +19,25 @@ def _month_str(d: date) -> str:
     return f"{d.year}年{d.month}月"
 
 
+def _day_str(d: date) -> str:
+    return f"{d.year}年{d.month}月{d.day}日"
+
+
 def rewrite(question: str, ref_date: date) -> str:
     """把问题中的相对时间绝对化；无相对时间则原样返回。"""
     out = question
+    # 昨天 / 今天 / 前天 → 具体日期（day 窗口）
+    m = re.search(r"昨天|今天|前天", out)
+    if m:
+        token = m.group(0)
+        if token == "昨天":
+            target = ref_date - relativedelta(days=1)
+        elif token == "前天":
+            target = ref_date - relativedelta(days=2)
+        else:
+            target = ref_date
+        out = out.replace(token, _day_str(target))
+        return out
     # 上上个月 / 上个月 / 这个月 / 本月
     m = re.search(r"上上个月|上个月|这个月|本月", out)
     if m:

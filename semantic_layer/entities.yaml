@@ -27,3 +27,6 @@ entities:
   channels:
     table: dim.channels
     primary_key: [channel_id]
+  inventory_snapshot:
+    table: ods.inventory_snapshot
+    primary_key: [snapshot_date, sku_id]

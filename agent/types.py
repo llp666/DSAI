@@ -16,8 +16,8 @@ except ImportError:  # langgraph 未装（CI 等）时降级：messages 字段�
 
 
 class Window(BaseModel):
-    type: Literal["month"] = "month"
-    value: str = Field(description="月份，格式 YYYY-MM，如 2026-07")
+    type: Literal["month", "day"] = "month"
+    value: str = Field(description="窗口值：月窗口为 YYYY-MM（如 2026-07）；日窗口为 YYYY-MM-DD（如 2026-07-15）")
 
 
 class DimensionFilter(BaseModel):
@@ -45,6 +45,11 @@ class AgentState(TypedDict):
     stage: str                     # judge 判定结果（answer/repair/degrade/hallucination，trace 用）
     hallucination: bool            # 相关性校验层标记：LLM 编造无关合法查询（DSL 外实体，不可修→降级）
     intent_mismatch: bool          # 相关性校验层标记：粒度错位（要求分组/过滤但查询无维度，可修→repair）
+    preflight_kind: str            # 预检结果（pass/date/enum/granularity/cutoff）
+    preflight_reason: str          # 预检失败原因/回退建议
+    empty_result: bool             # 执行结果为空（[]/None）：走 reflect_empty 反思分支
+    _relaxed: bool                 # 空结果反思已放宽窗口（防重复放宽循环）
+    relax_attempts: int            # 放宽次数（上限防死循环）
     schema_text: str               # Token 预算裁剪后的相关表结构文本
     retrieved_tables: list[str]
     _retrieve_degraded: bool       # 检索降级标记（embedding 网络故障时关键词回退）

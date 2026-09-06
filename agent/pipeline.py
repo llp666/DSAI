@@ -22,6 +22,7 @@ from .embedding import Embedder, Reranker
 from .executor import Executor
 from .graph import DsaiGraph
 from .llm import LLMClient, build_llm
+from .monitor import MonitoredLLM, QuestionMonitor
 from .prompts import build_system_prompt
 from .prompt_budget import render_tables_budgeted
 from .repair import try_repair
@@ -64,13 +65,34 @@ class Pipeline:
         )
         self._answer_tpl = self._env.get_template("answer.j2")
         self._graph = None
+        self._monitor: QuestionMonitor | None = None  # 当前问题预算监控（answer 入口建）
 
     def _get_llm(self, use_alt: bool) -> LLMClient:
         if use_alt:
-            return build_llm(self.cfg, use_alt=True)
-        if self._llm is None:
+            llm = build_llm(self.cfg, use_alt=True)
+        elif self._llm is None:
             self._llm = build_llm(self.cfg)
-        return self._llm
+            llm = self._llm
+        else:
+            llm = self._llm
+        # 熔断包装：当前问题有监控时，每次调用计入预算（超限抛 BudgetExceeded）
+        if self._monitor is not None:
+            return MonitoredLLM(llm, self._monitor)
+        return llm
+
+    def begin_question(self, **limits) -> QuestionMonitor:
+        """开启单问预算监控（answer 入口调用）；重复调用则复用当前。"""
+        if self._monitor is None:
+            self._monitor = QuestionMonitor(**limits)
+        return self._monitor
+
+    def end_question(self) -> dict | None:
+        """结束单问监控，返回预算快照并清理。"""
+        if self._monitor is None:
+            return None
+        snap = self._monitor.snapshot()
+        self._monitor = None
+        return snap
 
     # ---------- 语义查询生成（含 pydantic 校验 + 重试 1 次） ----------
     def _parse_semantic_query(self, raw: str) -> SemanticQuery:

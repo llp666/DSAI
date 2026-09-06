@@ -28,11 +28,20 @@ def _dim_block(layer: SemanticLayer) -> str:
     return "\n".join(lines)
 
 
-def _dsl_schema() -> str:
+def _dsl_schema(today: str) -> str:
     return (
         '{"metric": "<指标名>", "window": {"type": "month", "value": "YYYY-MM"},'
-        ' "dimensions": ["<维度名>"], "filters": [{"dim": "<维度名>", "op": "=", "value": "<值>"}]}'
+        ' "dimensions": ["<维度名>"], "filters": [{"dim": "<维度名>", "op": "=", "value": "<值>"}]}\n'
+        '# 日窗口变体（问题问某一天/昨天/今天的指标时用）：\n'
+        '#   {"type": "day", "value": "YYYY-MM-DD"}，如 "2026-07-15"\n'
+        f'# 今天：{today}；「昨天」→ 今天减一天（如 {today} 前一天）'
     )
+
+
+def _yesterday(today: str) -> str:
+    from datetime import date, timedelta
+
+    return (date.fromisoformat(today) - timedelta(days=1)).isoformat()
 
 
 FEW_SHOT: list[tuple[str, dict]] = [
@@ -58,12 +67,20 @@ FEW_SHOT: list[tuple[str, dict]] = [
         {"metric": "repurchase_rate", "window": {"type": "month", "value": "2025-11"},
          "dimensions": [], "filters": []},
     ),
+    (
+        "昨天GMV是多少？",
+        {"metric": "gmv", "window": {"type": "day", "value": "__YESTERDAY__"},
+         "dimensions": [], "filters": []},
+    ),
 ]
 
 
 def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> str:
+    # 动态填充「昨天」示例的日期（基于参考日 today）
+    yesterday = _yesterday(today)
     few_shot = "\n\n".join(
-        f"问：{q}\n答：{json.dumps(sq, ensure_ascii=False)}" for q, sq in FEW_SHOT
+        f"问：{q}\n答：{json.dumps(sq, ensure_ascii=False).replace('__YESTERDAY__', yesterday)}"
+        for q, sq in FEW_SHOT
     )
     return f"""你是电商数据分析 Agent 的语义查询生成器。你的唯一任务：把用户的自然语言问题，映射为一个结构化的语义查询 JSON，引用语义层已定义的指标。你绝不编写原始 SQL。
 
@@ -77,10 +94,12 @@ def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> s
 {schema_text}
 
 # 输出格式（只输出合法 JSON，不要输出解释或其他文字）
-{_dsl_schema()}
+{_dsl_schema(today)}
 
 # 规则
 - 今天的日期：{today}。「上个月」按今天往前推一个月；明确给月份就用该月。
+- 问「昨天/今天/某一天」的指标 → 用 day 窗口（window.type="day"，value=YYYY-MM-DD）。「昨天」= {yesterday}。
+- 月粒度指标默认 window.type="month"；只有明确问单日才用 day 窗口（复购率等滚动窗口指标不支持 day，只用 month）。
 - 无维度下钻时，dimensions 与 filters 输出空数组 []。
 - 维度值必须来自值字典；「品类」→ category_type，「城市/线级」→ city_tier，「渠道」→ channel，「渠道类型」→ channel_type。
 - 净销售额与 GMV 是不同指标：净销售额扣退款，GMV 不扣。问「销售额/卖了多少钱」默认 net_sales_amount；明确说「GMV/成交额」→ gmv。

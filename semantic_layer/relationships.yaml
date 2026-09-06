@@ -50,3 +50,9 @@ relationships:
     "on":
       - [ads_campaigns.channel_id, channels.channel_id]
     cardinality: many_to_one
+  inventory_snapshot_to_products:
+    left: inventory_snapshot
+    right: products
+    "on":
+      - [inventory_snapshot.sku_id, products.sku_id]
+    cardinality: many_to_one

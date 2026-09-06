@@ -77,6 +77,16 @@
             "combine": { "type": "string" },
             "window": { "type": "string" },
             "window_anchor": { "type": "string" },
+            "kind": { "type": "string", "enum": ["snapshot"] },
+            "snapshot": {
+              "type": "object",
+              "required": ["entity", "cond"],
+              "properties": {
+                "entity": { "type": "string" },
+                "cond": { "type": "string" },
+                "when": { "type": "string", "enum": ["end"] }
+              }
+            },
             "rank": {
               "type": "object",
               "required": ["group_key", "order", "limit"],

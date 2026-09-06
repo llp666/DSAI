@@ -47,6 +47,7 @@ SUPPORTED_METRICS = {
     "gmv", "net_sales_amount", "orders_count", "avg_order_value",
     "refund_amount", "refund_rate", "repurchase_rate", "marketing_roi",
     "net_profit", "gross_margin", "top_sku_by_net_sales",
+    "stockout_skus_count",
 }
 
 
