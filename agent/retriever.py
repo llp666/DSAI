@@ -161,6 +161,26 @@ class Retriever:
             out = ordered
         return out
 
+    def retrieve_keyword_only(self, question: str, *, top_tables: int = 3) -> list[dict]:
+        """纯关键词检索（embedding 网络故障时降级，不依赖 vector_store）。
+
+        用关键词加权分排序取 Top-K 真实表。命中率低于混合检索，但可用。
+        """
+        keyword_scores = {}
+        for tid, doc in self._docs.items():
+            if _is_catalog(tid):
+                continue
+            kw = _keyword_rank(question, doc)
+            if kw > 0:
+                keyword_scores[tid] = kw
+        ranked = sorted(keyword_scores, key=keyword_scores.get, reverse=True)
+        out = []
+        for tid in ranked:
+            if len(out) >= top_tables:
+                break
+            out.append(self._docs[tid])
+        return out
+
     @staticmethod
     def _table_text(doc: dict) -> str:
         return f"{doc.get('table','')}：{doc.get('description','')} " \

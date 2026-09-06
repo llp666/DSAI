@@ -42,15 +42,21 @@ class SemanticQuery(BaseModel):
 class AgentState(TypedDict):
     question: str
     intent: str                    # 意图/域分类标签（营销/订单/供应链/…，judge/repair 可据此取规则）
-    stage: str                     # judge 判定结果（answer/repair/degrade，trace 用）
+    stage: str                     # judge 判定结果（answer/repair/degrade/hallucination，trace 用）
+    hallucination: bool            # 相关性校验层标记：LLM 编造无关合法查询（DSL 外实体，不可修→降级）
+    intent_mismatch: bool          # 相关性校验层标记：粒度错位（要求分组/过滤但查询无维度，可修→repair）
     schema_text: str               # Token 预算裁剪后的相关表结构文本
     retrieved_tables: list[str]
+    _retrieve_degraded: bool       # 检索降级标记（embedding 网络故障时关键词回退）
     semantic_query: Optional[SemanticQuery]
     compiled_sql: Optional[str]
     execution_result: Any
     execution_error: Optional[str]
     errors: list[str]              # 累积错误文本（真实错误，回灌给 generate 重试）
+    error_categories: list[str]    # 每轮错误的三分类结果（dialect/reference/logic/unknown）
+    error_classifications: list[dict]  # 完整分类记录（category+entity+reason，进 Langfuse）
     error_feedback: str            # 回灌上下文（repair/reflect 产出）
+    _reflect_fixed: bool           # reflect 已重写语义查询（跳过 generate 覆盖，直接重编译）
     retry_count: int
     max_retries: int
     messages: Annotated[list[AnyMessage], add_messages]  # 工具调用消息链（ToolNode 回灌）

@@ -28,8 +28,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from .compiler import CompileError, compile_query
+from .error_classifier import build_repair_prompt, classify_error, format_available_dimensions
 from .prompt_budget import render_tables_budgeted
-from .repair import try_repair
+from .relevance import check_relevance
 from .rewrite import rewrite
 from .types import AgentState, SemanticQuery
 
@@ -156,19 +157,30 @@ class DsaiGraph:
 
     def retrieve_node(self, state: AgentState) -> dict:
         with self._span("retrieve", output={"intent": state.get("intent")}):
+            degraded = False
+            tables = []
             if self._vector_store is not None:
-                tables = self.retriever.retrieve_hybrid(
-                    state["question"], self._vector_store, top_tables=3,
-                    vector_n=10, reranker=self._reranker)
-            else:
-                tables = self.retriever.retrieve(state["question"])
+                try:
+                    tables = self.retriever.retrieve_hybrid(
+                        state["question"], self._vector_store, top_tables=3,
+                        vector_n=10, reranker=self._reranker)
+                except Exception as e:
+                    # embedding 网络故障降级：纯关键词检索（记录进 trace，不崩溃）
+                    degraded = True
+                    tables = self.retriever.retrieve_keyword_only(state["question"])
+            if not tables:
+                tables = self.retriever.retrieve(state["question"])  # 最终回退硬编码
             schema_text, _ = render_tables_budgeted(tables, RETRIEVAL_BUDGET)
             return {
                 "retrieved_tables": [t["table"] for t in tables],
                 "schema_text": schema_text,
+                "_retrieve_degraded": degraded,
             }
 
     def generate_node(self, state: AgentState) -> dict:
+        # reflect 已重写语义查询：透传（不再调 LLM 覆盖修复结果），直接进 tools 重编译验证
+        if state.get("_reflect_fixed"):
+            return {"execution_error": None, "_reflect_fixed": False}
         with self._span("generate", input={"retry": state.get("retry_count")}):
             llm = self.p._get_llm(self._use_alt)
             today = self.cfg.reference_date or date.today().isoformat()
@@ -215,6 +227,23 @@ class DsaiGraph:
             # add_messages reducer 会追加，只返回本轮新增消息
             return {**upd, "errors": errors, "messages": msgs[start:]}
 
+    def validate_node(self, state: AgentState) -> dict:
+        """相关性/意图校验：DSL 外实体 → hallucination（降级）；粒度错位 → intent_mismatch（repair 修复）。"""
+        q = state.get("question", "")
+        sq = state.get("semantic_query")
+        if sq is None:
+            return {"hallucination": False, "intent_mismatch": False}
+        verdict = check_relevance(q, sq.metric, sq.dimensions, sq.filters)
+        with self._span("validate", output={"kind": verdict.kind,
+                                            "reason": verdict.reason}):
+            if verdict.kind == "hallucination":
+                return {"hallucination": True, "intent_mismatch": False,
+                        "execution_error": verdict.reason}
+            if verdict.kind == "granularity":
+                return {"hallucination": False, "intent_mismatch": True,
+                        "error_feedback": verdict.reason}
+            return {"hallucination": False, "intent_mismatch": False}
+
     def judge_node(self, state: AgentState) -> dict:
         """judge 图节点：记录判定结果供 trace（条件路由在 _judge_cond）。"""
         stage = self._judge_cond(state)
@@ -223,7 +252,11 @@ class DsaiGraph:
             return {"stage": stage}
 
     def _judge_cond(self, state: AgentState) -> Literal["answer", "repair", "degrade"]:
-        """四优先级：成功 → answer；LLM 生成失败 → degrade；重试耗尽 → degrade；有错误 → repair。"""
+        """判定优先级：幻觉→degrade；粒度错位→repair；成功→answer；生成失败→degrade；重试耗尽→degrade；有错→repair。"""
+        if state.get("hallucination"):
+            return "degrade"
+        if state.get("intent_mismatch") and state.get("retry_count", 0) < state.get("max_retries", MAX_RETRIES):
+            return "repair"
         if state.get("execution_result") is not None:
             return "answer"
         if state.get("semantic_query") is None:
@@ -235,48 +268,110 @@ class DsaiGraph:
         return "answer"
 
     def repair_node(self, state: AgentState) -> dict:
+        """错误三分类分级。坑点①铁律：严禁直接补丁 SQL 文本——所有修复落语义查询层再重编译。
+        粒度错位（intent_mismatch）不属编译错，跳过错误分类，直接计重试次数。"""
+        # 粒度错位：不分类、不 try_repair，直接推进到 reflect 补维度
+        if state.get("intent_mismatch"):
+            return {"retry_count": state.get("retry_count", 0) + 1}
         with self._span("repair", input={"n_errors": len(state.get("errors", []))}):
             errors = state.get("errors", [])
             err = errors[-1] if errors else "未知错误"
             sql = state.get("compiled_sql")
+            cls = classify_error(err, sql or "")
+            categories = list(state.get("error_categories", [])) + [cls.category]
+            classifications = list(state.get("error_classifications", [])) + [
+                {"category": cls.category, "entity": cls.entity,
+                 "reason": cls.reason, "error": err[:200]}
+            ]
             feedback = f"SQL 校验/执行失败：{err}"
-            if sql:
-                repaired = try_repair(err, sql)
-                if repaired:
-                    feedback += f"\n确定性修复已应用：\n{repaired}"
             return {
+                "error_categories": categories,
+                "error_classifications": classifications,
                 "error_feedback": feedback,
                 "retry_count": state.get("retry_count", 0) + 1,
             }
 
     def reflect_node(self, state: AgentState) -> dict:
-        with self._span("reflect", input={"feedback": state.get("error_feedback", "")[:200]}):
+        """按错误类型反思：粒度错位→回灌补维度；引用/逻辑/方言→LLM 重写语义查询 JSON。"""
+        categories = state.get("error_categories", [])
+        cat = categories[-1] if categories else "unknown"
+        feedback = state.get("error_feedback", "")
+        # 粒度错位：问题要求分组/过滤但查询无维度 → 回灌让 LLM 补合法维度
+        if state.get("intent_mismatch"):
+            with self._span("reflect", output={"kind": "granularity",
+                                               "reason": feedback[:150]}):
+                llm = self.p._get_llm(self._use_alt)
+                system = (
+                    "你是电商数据分析 Agent 的纠错器。用户问题要求按维度分组或过滤，"
+                    "但上一轮生成的语义查询没有任何维度/过滤（粒度错位）。"
+                    "请根据下方「可用维度」清单，补上正确的维度/过滤后重写语义查询 JSON。\n\n"
+                    f"可用维度：\n{format_available_dimensions(self.layer)}\n"
+                    "只输出合法 JSON（metric/window/dimensions/filters），不要解释。"
+                )
+                user = f"问题：{state['question']}\n错位原因：{feedback}"
+                try:
+                    raw = llm.complete(system, user)
+                    sq = self.p._parse_semantic_query(raw)
+                    return {"semantic_query": sq, "_reflect_fixed": True,
+                            "intent_mismatch": False,
+                            "error_feedback": feedback + "\n（已补维度重写）"}
+                except Exception:
+                    return {"intent_mismatch": False,
+                            "error_feedback": feedback + "\n（补维度重写失败，降级）"}
+        # 引用/逻辑/方言/未知错：LLM 按分类 prompt 直接重写语义查询 JSON
+        cls_records = state.get("error_classifications", [])
+        reason = cls_records[-1].get("reason", "") if cls_records else ""
+        with self._span("reflect", input={"feedback": feedback[:200], "category": cat,
+                                          "reason": reason}):
             llm = self.p._get_llm(self._use_alt)
-            system = (
-                "你是电商数据分析 Agent 的纠错反思器。用户的问题经语义查询→SQL 链路失败，"
-                "错误文本如下。请分析失败原因，给出修正后的语义查询要点（指标/过滤值/维度），"
-                "不超过 3 句话。只输出分析，不要输出 JSON 或 SQL。"
-            )
-            user = f"问题：{state['question']}\n\n错误与修复上下文：\n{state.get('error_feedback', '')}"
+            metric = state["semantic_query"].metric if state.get("semantic_query") else ""
+            error = state["errors"][-1] if state.get("errors") else ""
+            system, user = build_repair_prompt(
+                state["question"], metric, cat, error, self.layer, feedback)
             try:
-                advice = llm.complete(system, user)
-            except Exception as e:
-                advice = f"（反思失败：{e}）"
-            return {"error_feedback": state.get("error_feedback", "") + "\n反思建议：\n" + advice}
+                raw = llm.complete(system, user)
+                sq = self.p._parse_semantic_query(raw)
+                # 重写成功：标记跳过 generate，直接进 tools 用修复后的语义查询重编译验证
+                return {"semantic_query": sq, "_reflect_fixed": True,
+                        "error_feedback": feedback + "\n（已重写语义查询）"}
+            except Exception:
+                # 重写失败：保留原错误反馈，让 generate 自行尝试修正
+                return {"error_feedback": feedback}
 
     def answer_node(self, state: AgentState) -> dict:
         with self._span("answer", output={"stage": state.get("stage")}):
             sq = state.get("semantic_query")
             # 正常完成：语义查询有效且无错误（execution_result 可为 None=无数据，_assemble_answer 处理）
-            if sq is not None and not state.get("errors") and not state.get("execution_error"):
+            if sq is not None and not state.get("errors") and not state.get("execution_error") \
+                    and not state.get("hallucination"):
                 answer = self.p._assemble_answer(
                     sq, state.get("execution_result"),
                     state["retrieved_tables"], state.get("compiled_sql"))
-            else:
-                err = (state.get("execution_error")
-                       or (state["errors"][-1] if state.get("errors") else "未知错误"))
-                answer = f"无法回答：{err}"
-            return {"answer": answer}
+                return {"answer": answer}
+            # 幻觉拦截：明确提示问题超出可答范围（意图错位），不返回错数据
+            if state.get("hallucination"):
+                hint = (state.get("execution_error")
+                        or "问题包含语义层无法表达的实体（如订单号/状态明细），无法回答")
+                return {"answer": (
+                    f"无法回答：该问题超出了当前可查询范围。\n"
+                    f"原因：{hint}\n"
+                    "建议：改为按月份/品类/渠道/城市等维度查询聚合指标（GMV/订单数/退款率等）。")}
+            # 降级：明确提示 + 已试 SQL + 错误摘要 + 建议人工介入
+            err = (state.get("execution_error")
+                   or (state["errors"][-1] if state.get("errors") else "未知错误"))
+            error_summary = err[:300]
+            sql = state.get("compiled_sql")
+            categories = state.get("error_categories", [])
+            cat_desc = "、".join(categories) if categories else "未分类"
+            tried = (f"\n已尝试 SQL：\n{sql}" if sql else "\n（语义查询未编译成 SQL）")
+            advice = (
+                f"无法自动修复该问题（错误类别：{cat_desc}，已重试 {state.get('retry_count', 0)} 次）。\n"
+                f"错误摘要：{error_summary}\n"
+                f"{tried}\n"
+                "建议：① 换个措辞重新提问（避免引用不支持的状态/字段）；"
+                "② 若为数据问题，联系数仓管理员人工介入。"
+            )
+            return {"answer": f"无法回答：{advice}"}
 
     # ---------- 图构建 ----------
 
@@ -286,6 +381,7 @@ class DsaiGraph:
         g.add_node("retrieve", self.retrieve_node)
         g.add_node("generate", self.generate_node)
         g.add_node("tools", self.tools_node)
+        g.add_node("validate", self.validate_node)
         g.add_node("judge", self.judge_node)
         g.add_node("repair", self.repair_node)
         g.add_node("reflect", self.reflect_node)
@@ -295,7 +391,8 @@ class DsaiGraph:
         g.add_edge("intent", "retrieve")
         g.add_edge("retrieve", "generate")
         g.add_edge("generate", "tools")
-        g.add_edge("tools", "judge")
+        g.add_edge("tools", "validate")
+        g.add_edge("validate", "judge")
         g.add_conditional_edges(
             "judge", self._judge_cond,
             {"answer": "answer", "repair": "repair", "degrade": "answer"},
@@ -313,14 +410,20 @@ class DsaiGraph:
             "question": question,
             "intent": "",
             "stage": "",
+            "hallucination": False,
+            "intent_mismatch": False,
             "schema_text": "",
             "retrieved_tables": [],
+            "_retrieve_degraded": False,
             "semantic_query": None,
             "compiled_sql": None,
             "execution_result": None,
             "execution_error": None,
             "errors": [],
+            "error_categories": [],
+            "error_classifications": [],
             "error_feedback": "",
+            "_reflect_fixed": False,
             "retry_count": 0,
             "max_retries": MAX_RETRIES,
             "messages": [],
