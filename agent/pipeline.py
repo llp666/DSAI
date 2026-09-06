@@ -18,14 +18,21 @@ from pydantic import ValidationError
 
 from .compiler import CompileError, compile_query
 from .config import Config, load_config, resolve
+from .embedding import Embedder, Reranker
 from .executor import Executor
 from .llm import LLMClient, build_llm
 from .prompts import build_system_prompt
+from .prompt_budget import render_tables_budgeted
 from .repair import try_repair
 from .retriever import Retriever
 from .semantic_layer import load_semantic_layer
 from .tracing import build_tracer
 from .types import AgentState, SemanticQuery
+from .vector_store import VectorStore
+
+
+# 检索注入 Token 预算（agnes maxInput 128k 的 1/8，预留指令/回答余量）
+RETRIEVAL_BUDGET = 16000
 
 
 class Pipeline:
@@ -39,6 +46,18 @@ class Pipeline:
         self.executor = Executor(resolve(self.cfg.duckdb_path))
         self.tracer = build_tracer(self.cfg)
         self._llm: LLMClient | None = None
+        self._vector_store = None
+        self._reranker = None
+        emb = self.cfg.embedding or self.cfg.alt_embedding
+        if emb:
+            self._vector_store = VectorStore(
+                emb.chroma_dir,
+                Embedder(emb.provider, emb.base_url, emb.api_key, emb.model,
+                         emb.dimensions, emb.instruction, emb.task))
+            if self.cfg.rerank and self.cfg.rerank.api_key:
+                self._reranker = Reranker(self.cfg.rerank.base_url,
+                                          self.cfg.rerank.api_key,
+                                          self.cfg.rerank.model)
         self._env = Environment(
             loader=FileSystemLoader(resolve(Path("agent/templates")))
         )
@@ -60,9 +79,9 @@ class Pipeline:
             text = m.group(1)
         return SemanticQuery.model_validate_json(text)
 
-    def _generate(self, question: str, tables: list[dict], llm: LLMClient,
+    def _generate(self, question: str, schema_text: str, llm: LLMClient,
                   today: str) -> tuple[SemanticQuery | None, str | None, int]:
-        system = build_system_prompt(self.layer, tables, today)
+        system = build_system_prompt(self.layer, schema_text, today)
         last_error: str | None = None
         for attempt in range(2):  # 首次 + 重试 1 次
             user = question if attempt == 0 else (
@@ -133,11 +152,23 @@ class Pipeline:
             "trace_id": "",
         }
         with self.tracer.trace(f"question: {question[:40]}") as t:
-            # 1) 检索（阶段一硬编码 Top-3）
+            # 1) 检索（v2 混合检索：向量+关键词 RRF；无 embedding 时回退硬编码）
             with t.span("retrieve") as sp:
-                tables = self.retriever.retrieve(question)
+                if self._vector_store is not None:
+                    tables = self.retriever.retrieve_hybrid(
+                        question, self._vector_store, top_tables=3,
+                        vector_n=10, reranker=self._reranker)
+                else:
+                    tables = self.retriever.retrieve(question)  # 回退
                 state["retrieved_tables"] = [x["table"] for x in tables]
-                sp.update(output={"tables": state["retrieved_tables"]})
+                # Token 预算裁剪：先字段明细、后描述，外键永不裁
+                schema_text, budget_reports = render_tables_budgeted(
+                    tables, RETRIEVAL_BUDGET)
+                sp.update(output={
+                    "tables": state["retrieved_tables"],
+                    "schema_tokens": len(schema_text),
+                    "budget": RETRIEVAL_BUDGET,
+                })
 
             # 2) 语义查询生成（pydantic 校验 + 重试 1 次）
             sq, raw, attempts = None, None, 0
@@ -146,7 +177,7 @@ class Pipeline:
                 output={"raw": None},
             ) as gen:
                 try:
-                    sq, raw, attempts = self._generate(question, tables, llm, today)
+                    sq, raw, attempts = self._generate(question, schema_text, llm, today)
                 except Exception as e:
                     state["execution_error"] = f"LLM 调用失败: {e}"
                     state["answer"] = f"无法生成语义查询：{e}"

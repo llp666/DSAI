@@ -61,7 +61,7 @@ FEW_SHOT: list[tuple[str, dict]] = [
 ]
 
 
-def build_system_prompt(layer: SemanticLayer, tables: list[dict], today: str) -> str:
+def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> str:
     few_shot = "\n\n".join(
         f"问：{q}\n答：{json.dumps(sq, ensure_ascii=False)}" for q, sq in FEW_SHOT
     )
@@ -73,8 +73,8 @@ def build_system_prompt(layer: SemanticLayer, tables: list[dict], today: str) ->
 # 可用维度（含值字典，过滤值必须取自此清单）
 {_dim_block(layer)}
 
-# 相关表结构（已由检索层注入）
-{Retriever.render(tables)}
+# 相关表结构（已由检索层动态注入，Token 预算裁剪后）
+{schema_text}
 
 # 输出格式（只输出合法 JSON，不要输出解释或其他文字）
 {_dsl_schema()}
