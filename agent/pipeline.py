@@ -128,6 +128,16 @@ class Pipeline:
         suffix = self._dim_suffix(sq)
         if value is None:
             return f"【{meta['display_name']}】{ym}" + (f" · {suffix}" if suffix else "") + " 无数据"
+        # 多行分组结果（各品类GMV等）：逐行渲染「维度值: 指标值」
+        if isinstance(value, list):
+            lines = [f"【{meta['display_name']}】{ym}"
+                     + (f" · {suffix}" if suffix else "")]
+            for row in value:
+                if isinstance(row, list) and row:
+                    dim_v = row[0]
+                    val_v = row[1] if len(row) > 1 else row[0]
+                    lines.append(f"  {dim_v}: {self._format_value(sq.metric, val_v)}")
+            return "\n".join(lines) + "\n\n口径：" + meta["description"]
         return self._answer_tpl.render(
             metric_name=meta["display_name"],
             month=ym,

@@ -74,6 +74,17 @@ def _classify_intent(question: str) -> str:
     return "通用"
 
 
+def _parse_result(res: str):
+    """解析 execute_tool 返回的 JSON 行数组：单行单列→标量，多行→list[list]。"""
+    try:
+        rows = json.loads(res)
+    except json.JSONDecodeError:
+        return res
+    if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], list) and len(rows[0]) == 1:
+        return rows[0][0]
+    return rows
+
+
 class DsaiGraph:
     def __init__(self, pipeline: Any):
         self.p = pipeline
@@ -115,13 +126,12 @@ class DsaiGraph:
 
         @tool
         def execute_tool(sql: str) -> str:
-            """执行只读 SQL，返回首行首列结果（JSON 序列化，Decimal→float 保类型）。"""
+            """执行只读 SQL，返回完整行结果（JSON 数组；Decimal→float 保类型）。"""
             try:
                 rows = executor.execute(sql)
             except Exception as e:
                 raise RuntimeError(f"SQL 执行失败: {e}") from e
-            value = rows[0][0] if rows else None
-            return json.dumps(value, ensure_ascii=False,
+            return json.dumps(rows, ensure_ascii=False,
                               default=lambda o: float(o) if isinstance(o, Decimal) else str(o))
 
         self._tools = [compile_tool, dry_run_tool, execute_tool]
@@ -220,10 +230,7 @@ class DsaiGraph:
                         if err:
                             errors.append(err)
                         else:
-                            try:
-                                upd["execution_result"] = json.loads(res)
-                            except json.JSONDecodeError:
-                                upd["execution_result"] = res
+                            upd["execution_result"] = _parse_result(res)
             # add_messages reducer 会追加，只返回本轮新增消息
             return {**upd, "errors": errors, "messages": msgs[start:]}
 
