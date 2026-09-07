@@ -24,6 +24,16 @@ class LLMClient:
     def complete(self, system: str, user: str) -> str:
         raise NotImplementedError
 
+    def complete_with_tools(self, system: str, user: str,
+                            tools: list[dict]) -> tuple[str, list | None]:
+        """可选工具调用：返回 (content, tool_calls 或 None)。
+
+        tools：OpenAI 兼容 function 工具定义列表。LLM 可返回 tool_calls（列表）或
+        纯文本 content（不调工具）。tool_calls 元素形如
+        {"name": ..., "arguments": {...}, "id": ...}。
+        """
+        raise NotImplementedError
+
     @property
     def model(self) -> str:
         raise NotImplementedError
@@ -36,9 +46,25 @@ class OpenAICompatClient(LLMClient):
         self.last_usage: dict | None = None  # 最近一次调用的 token 用量（供埋点）
 
     def complete(self, system: str, user: str) -> str:
+        content, _ = self._chat(system, user, tools=None)
+        return content
+
+    def complete_with_tools(self, system: str, user: str,
+                            tools: list[dict]) -> tuple[str, list | None]:
+        content, tool_calls = self._chat(system, user, tools=tools)
+        return content, tool_calls
+
+    def _chat(self, system: str, user: str, tools: list | None):
+        """共享的 chat.completions 调用：返回 (content, tool_calls 或 None)。
+
+        429 限流退避重试（最多 3 次）；记录 last_usage 供熔断计 token。
+        """
         import time
 
         last_exc: Exception | None = None
+        kwargs: dict = {}
+        if tools:
+            kwargs["tools"] = tools
         for attempt in range(3):  # 429 限流退避重试（最多 3 次）
             try:
                 resp = self._client.chat.completions.create(
@@ -49,6 +75,7 @@ class OpenAICompatClient(LLMClient):
                     ],
                     temperature=self._cfg.temperature,
                     max_tokens=self._cfg.max_tokens,
+                    **kwargs,
                 )
             except Exception as e:  # 供应商网络/鉴权等错误统一包装
                 if "429" in str(e) and attempt < 2:
@@ -69,13 +96,30 @@ class OpenAICompatClient(LLMClient):
             "output": getattr(u, "completion_tokens", 0),
             "total": getattr(u, "total_tokens", 0),
         }
-        content = (resp.choices[0].message.content or "").strip()
-        if not content:
+        msg = resp.choices[0].message
+        content = (msg.content or "").strip()
+        tool_calls = None
+        if getattr(msg, "tool_calls", None):
+            tool_calls = []
+            for tc in msg.tool_calls:
+                fn = tc.function
+                args = getattr(fn, "arguments", None)
+                import json
+                try:
+                    args = json.loads(args or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append({
+                    "id": tc.id,
+                    "name": fn.name,
+                    "arguments": args,
+                })
+        if not content and not tool_calls:
             raise LLMError(
                 f"LLM 返回空内容 [{self._cfg.provider}/{self._cfg.model}]，"
                 "可能是 thinking 模式耗尽 max_tokens，请调大 LLM_MAX_TOKENS"
             )
-        return content
+        return content, tool_calls
 
     @property
     def model(self) -> str:

@@ -64,6 +64,9 @@ class AgentState(TypedDict):
     _reflect_fixed: bool           # reflect 已重写语义查询（跳过 generate 覆盖，直接重编译）
     retry_count: int
     max_retries: int
+    tool_answer: Optional[str]     # 诊断工具直接产出的洞察答案（走工具轨，跳过语义查询）
+    tool_used: Optional[str]       # 本次命中的诊断工具名（inventory_diagnostic / marketing_funnel，trace 用）
+    _tool_chart: Optional[str]     # 工具返回的 Plotly figure JSON（app 渲染，state 只放 JSON 化字符串）
     messages: Annotated[list[AnyMessage], add_messages]  # 工具调用消息链（ToolNode 回灌）
     answer: str
     trace_id: str

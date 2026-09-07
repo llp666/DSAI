@@ -13,3 +13,5 @@ chromadb>=1.0
 python-dateutil>=2.9
 tiktoken>=0.7
 langgraph>=1.0
+plotly>=5.0
+streamlit>=1.30

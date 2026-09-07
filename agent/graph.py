@@ -32,8 +32,13 @@ from .error_classifier import build_repair_prompt, classify_error, format_availa
 from .monitor import BudgetExceeded
 from .preflight import preflight
 from .prompt_budget import render_tables_budgeted
+from .prompts import build_system_prompt
 from .relevance import check_relevance
 from .rewrite import rewrite
+from .tool_contract import ToolError, serialize_result
+from .tool_router import route_tool_intent
+from .tools_inventory import inventory_diagnostic_tool
+from .tools_marketing import marketing_roi_funnel_tool
 from .types import AgentState, SemanticQuery
 
 # 检索注入 Token 预算（agnes maxInput 128k 的 1/8，预留指令/回答余量）
@@ -90,6 +95,42 @@ def _parse_result(res: str):
 def _is_empty(result) -> bool:
     """空结果判定：None 或空列表（rank/snapshot 类指标无数据时返回 []）。"""
     return result is None or (isinstance(result, list) and len(result) == 0)
+
+
+def _looks_like_json(text: str) -> bool:
+    """粗判 LLM 输出是否像 JSON（语义查询对象）。"""
+    t = text.strip()
+    return t.startswith("{") or t.startswith("```json") or t.startswith("```")
+
+
+def _jsonable_state(final: dict) -> dict:
+    """③ 序列化防御：剔除 state 中不消费且不可 JSON 化的消息对象。
+
+    LangGraph 把 AIMessage/ToolMessage 对象累积进 state.messages，app/eval 均不消费；
+    一旦 telemetry/日志整体 json.dumps(state) 会因消息对象序列化失败。只剔除 messages。
+    semantic_query 是 pydantic 模型，虽非 JSON 标量但被 eval（run_eval/run_injection）
+    按模型消费（.model_dump()/.dimensions/.window.value），保留原样。
+    chart 已在上游固化为 JSON 字符串（_tool_chart），全链无 go.Figure 对象出圈。
+    """
+    return {k: v for k, v in final.items() if k != "messages"}
+
+
+def _build_tool_user(question: str, tool_result: str | None) -> str:
+    """构造工具调用轮的 user 消息：首轮只给问题；后续把工具结果/错误一并给 LLM 收敛。
+
+    工具成功 → 基于结果给自然语言洞察；工具错误 → 提示改用语义查询 JSON 走指标链路。
+    """
+    if not tool_result:
+        return question
+    if tool_result.startswith("工具调用失败"):
+        return (f"问题：{question}\n\n"
+                f"【诊断工具调用失败】\n{tool_result}\n\n"
+                "请不要再调用诊断工具，改用语义查询 JSON 回答这个问题"
+                "（引用语义层已定义的指标，如 marketing_roi 按渠道类型聚合 ROI）。")
+    return (f"问题：{question}\n\n"
+            f"【已调用的诊断工具结果】\n{tool_result}\n\n"
+            "请基于以上工具结果，用自然语言给出最终洞察答案。"
+            "若工具结果不足以回答，再输出语义查询 JSON。")
 
 
 def _parse_reflect_empty(raw: str) -> dict:
@@ -174,12 +215,47 @@ class DsaiGraph:
             return json.dumps(rows, ensure_ascii=False,
                               default=lambda o: float(o) if isinstance(o, Decimal) else str(o))
 
-        self._tools = [compile_tool, dry_run_tool, execute_tool]
+        @tool
+        def inventory_tool(args: dict) -> str:
+            """库存诊断工具：输入 sku_id/category，计算可售天数（库存/近30天日均）、
+            DOI（可售天数超90=呆滞）、近30天销量环比；输出逐 SKU 洞察 + DOI×环比散点象限图。
+            用于「某 SKU 还够卖几天」「哪些 SKU 呆滞」「补货建议」类问题。"""
+            try:
+                res = inventory_diagnostic_tool(executor, args)
+            except ToolError as e:
+                raise RuntimeError(e.as_text()) from e
+            return serialize_result(res)
+
+        @tool
+        def marketing_tool(args: dict) -> str:
+            """营销ROI漏斗工具：拆解曝光→点击→加购→支付各环节转化（按渠道类型）。
+            用于「投放漏斗」「转化链路」类问题。"""
+            try:
+                res = marketing_roi_funnel_tool(executor, args)
+            except ToolError as e:
+                raise RuntimeError(e.as_text()) from e
+            return serialize_result(res)
+
+        self._tools = [compile_tool, dry_run_tool, execute_tool,
+                       inventory_tool, marketing_tool]
         self._tool_node = ToolNode(self._tools, handle_tool_errors=True)
-        self._compile_tool, self._dry_run_tool, self._execute_tool = self._tools
+        self._compile_tool, self._dry_run_tool, self._execute_tool = self._tools[:3]
+        self._inventory_tool, self._marketing_tool = self._tools[3:]
 
     def _call_tool(self, name: str, args: dict, msgs: list, config) -> tuple[str | None, str | None]:
-        """通过 ToolNode 调用工具；错误包装成 ToolMessage，返回 (error, result)。"""
+        """调用工具；错误包装成 ToolMessage「Error: …」回灌纠错轨，返回 (error, result)。
+
+        诊断工具（inventory_tool/marketing_tool）直接调用底层函数（绕过 ToolNode 的
+        checkpointer config 依赖）；SQL 三工具走 ToolNode（图内 tools_node 复用）。
+        """
+        if name in ("inventory_tool", "marketing_tool"):
+            try:
+                res = (inventory_diagnostic_tool(self.executor, args) if name == "inventory_tool"
+                       else marketing_roi_funnel_tool(self.executor, args))
+                content = serialize_result(res)
+            except ToolError as e:
+                content = f"Error: {e.as_text()}"
+            return (content if content.startswith("Error:") else None), content
         call = AIMessage(content="", tool_calls=[{
             "name": name, "args": args, "id": f"call_{name}_{len(msgs)}", "type": "tool_call",
         }])
@@ -190,6 +266,129 @@ class DsaiGraph:
         if content.startswith("Error:"):
             return content, None
         return None, content
+
+    # ---------- 诊断工具可选调用（阶段 3-4E） ----------
+
+    def _tool_schemas(self) -> list[dict]:
+        """OpenAI 兼容的工具定义（给 LLM 可选调用）。
+
+        手工构造（不用 convert_to_openai_function）：`args: dict` 会被 langchain
+        转成 v__args 列表，丢失内部 JSON Schema。这里直接从工具模块的入参
+        JSON Schema 构造，保证 LLM 看到正确的参数定义。
+        """
+        from .tools_inventory import INVENTORY_ARGS_SCHEMA
+        from .tools_marketing import MARKETING_ARGS_SCHEMA
+        return [
+            {"type": "function", "function": {
+                "name": "inventory_tool",
+                "description": ("库存诊断工具：输入 sku_id/category，计算可售天数（库存/近30天日均）、"
+                                "DOI（可售天数超90=呆滞）、近30天销量环比；输出逐 SKU 洞察 + DOI×环比散点象限图。"
+                                "用于「某 SKU 还够卖几天」「哪些 SKU 呆滞」「补货建议」类问题。"),
+                "parameters": INVENTORY_ARGS_SCHEMA,
+            }},
+            {"type": "function", "function": {
+                "name": "marketing_tool",
+                "description": ("营销ROI漏斗工具：拆解曝光→点击→加购→支付各环节转化（按渠道类型）。"
+                                "用于「投放漏斗」「转化链路」类问题。"),
+                "parameters": MARKETING_ARGS_SCHEMA,
+            }},
+        ]
+
+    _TOOL_MAX_ROUNDS = 2  # generate 内工具调用循环上限（防 agnes 重复 tool_calls 烧 token）
+
+    def _tool_system_prompt(self, state: AgentState) -> str:
+        """工具轮 system prompt：语义查询 JSON 契约打底 + 工具调用规则。
+
+        基础 prompt（build_system_prompt）已含指标口径/值字典/JSON 契约——
+        LLM 在工具报错或不足时能回落到合法语义查询 JSON，不编造数字。
+        """
+        today = self.cfg.reference_date or date.today().isoformat()
+        base = build_system_prompt(self.p.layer, state["schema_text"], today)
+        return (
+            "你是电商数据分析 Agent。先判断问题是否适合调用诊断工具（见下方 functions）。\n"
+            "规则：\n"
+            "- inventory_tool 只用于「逐 SKU 明细诊断」：具体 SKU 还够卖几天/是否呆滞，"
+            "或「哪些/哪个 SKU 断货」列出 SKU 明细清单。\n"
+            "- 聚合计数题（如「断货 SKU 数是多少」「有多少 SKU 断货」「库存预警 SKU 数」）要的是一个总数，"
+            "不是 SKU 明细 → 不要调用 inventory_tool，直接输出语义查询 JSON（指标 stockout_skus_count）。\n"
+            "- marketing_tool 只用于投放漏斗/转化链路（曝光→点击→加购→支付分环节转化）。\n"
+            "- 调用工具后，基于工具返回的真实结果，用自然语言输出洞察（可引用 sku_id/天数/环比/环节转化率）。\n"
+            "- 工具报错/未实现/不足以回答 → 放弃工具，改输出下方「输出格式」的语义查询 JSON（引用已定义指标）。\n"
+            "- 没有任何真实数据来源时禁止编造数字；无法回答就明确说明，绝不猜数。\n\n"
+            f"{base}"
+        )
+
+    @staticmethod
+    def _extract_chart(res: str) -> str:
+        """从工具返回 JSON 提取 Plotly figure JSON（无图返回空串，供 app 渲染）。"""
+        try:
+            payload = json.loads(res)
+            chart = payload.get("chart") or {}
+            if chart.get("kind") == "plotly_figure_json":
+                return chart.get("figure_json", "")
+        except Exception:
+            pass
+        return ""
+
+    def _run_tool_round(self, state: AgentState, llm, config) -> tuple[dict, str | None, SemanticQuery | None]:
+        """一轮「LLM 可选调工具」：返回 (state 更新 dict, 洞察答案或 None, 语义查询或 None)。
+
+        流程：带 tools 调 LLM → 若返回 tool_calls 则执行工具（去重）→ 把 ToolResult 回灌 LLM →
+        LLM 收敛输出最终答案（洞察式）或语义查询 JSON。工具错误经 ToolMessage 回灌纠错轨。
+
+        返回值二选一（按优先级）：
+        - tool_answer 非 None → 工具洞察答案直接产出（走 answer，跳过语义查询链路）
+        - sq 非 None → 工具轮已收敛出合法语义查询 JSON（generate_node 直接用，不再二次生成）
+        两者皆 None → 工具轮未产出（应只发生在未进工具轮，调用方无需处理）。
+        """
+        msgs = list(state.get("messages", []))
+        start = len(msgs)
+        schemas = self._tool_schemas()
+        used_tool: str | None = None
+        tool_answer: str | None = None
+        sq: SemanticQuery | None = None
+        upd: dict = {"messages": msgs[start:]}
+        for round_i in range(self._TOOL_MAX_ROUNDS):
+            content, tool_calls = llm.complete_with_tools(
+                self._tool_system_prompt(state),
+                _build_tool_user(state["question"], tool_answer), schemas)
+            if not tool_calls:
+                # LLM 未调工具 → 输出是语义查询 JSON 或洞察答案文本
+                if _looks_like_json(content):
+                    try:
+                        sq = self.p._parse_semantic_query(content)
+                    except Exception:
+                        tool_answer = content  # 不是合法 JSON → 当洞察答案
+                    else:
+                        if used_tool:
+                            upd["tool_used"] = used_tool
+                        return upd, None, sq  # 语义查询链路（工具信息已记录）
+                else:
+                    # 纯文本 → 洞察答案
+                    tool_answer = content or tool_answer
+                break
+            # 有 tool_calls：去重后执行
+            seen: set = set()
+            last_res: str | None = None
+            for tc in tool_calls:
+                name = tc["name"]
+                key = (name, json.dumps(tc.get("arguments", {}), sort_keys=True))
+                if key in seen:
+                    continue  # agnes 偶发重复 tool_calls → 只执行一次
+                seen.add(key)
+                used_tool = name
+                err, res = self._call_tool(name, tc["arguments"], msgs, config)
+                last_res = f"工具调用失败：{err}" if err else res
+                if err is None and res:
+                    upd["_tool_chart"] = self._extract_chart(res)
+            tool_answer = last_res  # 完整 ToolResult JSON 或错误文本回灌下一轮收敛
+        if used_tool:
+            upd["tool_used"] = used_tool
+        upd["messages"] = msgs[start:]
+        # 工具调用失败且 LLM 未收敛 → 回落到语义查询链路（不让原始错误当最终答案）
+        if tool_answer and (tool_answer.startswith("工具调用失败") or tool_answer.startswith("Error:")):
+            return upd, None, None
+        return upd, tool_answer, sq
 
     # ---------- 节点 ----------
 
@@ -227,12 +426,27 @@ class DsaiGraph:
                 "_retrieve_degraded": degraded,
             }
 
-    def generate_node(self, state: AgentState) -> dict:
+    def generate_node(self, state: AgentState, config=None) -> dict:
         # reflect 已重写语义查询：透传（不再调 LLM 覆盖修复结果），直接进 tools 重编译验证
         if state.get("_reflect_fixed"):
             return {"execution_error": None, "_reflect_fixed": False}
         with self._span("generate", input={"retry": state.get("retry_count")}):
             llm = self.p._get_llm(self._use_alt)
+            # 工具可选调用轮（阶段 3-4E）：仅当意图路由命中诊断域（库存/营销漏斗）才进工具轮，
+            # 避免普通问题多一次带 tools 的 LLM 调用（token 开销 / 误触发）
+            upd: dict = {}
+            tool_answer: str | None = None
+            sq: SemanticQuery | None = None
+            intent = route_tool_intent(state["question"])
+            if intent.hit or intent.needs_llm:
+                upd, tool_answer, sq = self._run_tool_round(state, llm, config)
+            if tool_answer is not None:
+                # 工具洞察答案：直接走 answer，跳过语义查询链路
+                return {**upd, "tool_answer": tool_answer, "semantic_query": None,
+                        "execution_error": None, "stage": "tool"}
+            if sq is not None:
+                # 工具轮已收敛出合法语义查询 JSON：直接进 validate/tools，不再二次生成
+                return {**upd, "semantic_query": sq, "execution_error": None}
             today = self.cfg.reference_date or date.today().isoformat()
             question = state["question"]
             feedback = state.get("error_feedback", "")
@@ -245,7 +459,7 @@ class DsaiGraph:
                 raise  # 熔断：透传让 answer 捕获降级，不吞成普通失败
             except Exception as e:
                 return {"semantic_query": None, "execution_error": f"LLM 调用失败: {e}"}
-            return {"semantic_query": sq, "execution_error": None}
+            return {**upd, "semantic_query": sq, "execution_error": None}
 
     def tools_node(self, state: AgentState, config) -> dict:
         with self._span("tools", input={"n_errors": len(state.get("errors", []))}):
@@ -515,6 +729,11 @@ class DsaiGraph:
     def answer_node(self, state: AgentState) -> dict:
         with self._span("answer", output={"stage": state.get("stage")}):
             sq = state.get("semantic_query")
+            # 工具洞察答案（阶段 3-4E）：诊断工具直接产出，跳过语义查询链路
+            if state.get("tool_answer"):
+                return {"answer": (
+                    f"【诊断工具洞察】（{state.get('tool_used') or '工具'}）\n"
+                    f"{state['tool_answer']}")}
             # 空结果（执行过返回空列表，且无执行错误）：诚实渲染「无数据」，不猜测填充
             empty = isinstance(state.get("execution_result"), list) \
                 and len(state.get("execution_result")) == 0
@@ -573,6 +792,12 @@ class DsaiGraph:
 
     # ---------- 图构建 ----------
 
+    def _tool_answer_cond(self, state: AgentState) -> Literal["answer", "validate"]:
+        """generate 后路由：工具洞察答案（tool_answer 非空）→ 直达 answer；否则进 validate 预检。"""
+        if state.get("tool_answer"):
+            return "answer"
+        return "validate"
+
     def _reflect_empty_cond(self, state: AgentState) -> Literal["generate", "answer"]:
         """reflect_empty 后路由：已放宽窗口 → 重查；confirm → 诚实降级回答。"""
         if state.get("_relaxed") and not state.get("empty_result"):
@@ -596,8 +821,11 @@ class DsaiGraph:
         g.add_edge(START, "intent")
         g.add_edge("intent", "retrieve")
         g.add_edge("retrieve", "generate")
-        # validate 前置到编译前：预检/相关性拦截后再进 tools
-        g.add_edge("generate", "validate")
+        # 工具洞察答案（阶段 3-4E）直达 answer；否则 validate 前置到编译前
+        g.add_conditional_edges(
+            "generate", self._tool_answer_cond,
+            {"answer": "answer", "validate": "validate"},
+        )
         g.add_edge("validate", "judge")
         g.add_conditional_edges(
             "judge", self._judge_pre_cond,
@@ -647,6 +875,9 @@ class DsaiGraph:
             "_reflect_fixed": False,
             "retry_count": 0,
             "max_retries": MAX_RETRIES,
+            "tool_answer": "",
+            "tool_used": "",
+            "_tool_chart": "",
             "messages": [],
             "answer": "",
             "trace_id": "",
@@ -689,6 +920,7 @@ class DsaiGraph:
                     final["stage"] = "degrade"
             finally:
                 final.setdefault("budget", monitor.snapshot())  # _timed：预算快照进 final
+                final = _jsonable_state(final)  # ③ 序列化闸：剔除 pydantic/消息对象
                 self.p.end_question()
                 self._t = None
         final["trace_id"] = t.trace_id

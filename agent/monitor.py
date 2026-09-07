@@ -90,6 +90,13 @@ class MonitoredLLM:
         self._monitor.add_usage(self._llm.last_usage)
         return resp
 
+    def complete_with_tools(self, system: str, user: str,
+                            tools: list[dict]) -> tuple[str, list | None]:
+        self._monitor.record_call()
+        content, tool_calls = self._llm.complete_with_tools(system, user, tools)
+        self._monitor.add_usage(self._llm.last_usage)
+        return content, tool_calls
+
     @property
     def model(self) -> str:
         return self._llm.model
