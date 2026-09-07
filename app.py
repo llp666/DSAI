@@ -14,7 +14,7 @@ st.set_page_config(page_title="DSAI 电商数据分析 Agent", page_icon="📊",
 
 @st.cache_resource
 def get_pipeline():
-    from agent.pipeline import Pipeline
+    from orchestration.pipeline import Pipeline
     return Pipeline()
 
 

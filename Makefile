@@ -6,7 +6,7 @@ data-full:    ; $(PYTHON) -m datagen.cli --config datagen/config/scale_full.yaml
 validate:     ; $(PYTHON) -m datagen.validate --db warehouse/ecommerce.duckdb --config datagen/config/scale_full.yaml
 
 # ---- 阶段一/二：语义层与编译器 ----
-validate-schema: ; $(PYTHON) -m agent.semantic_layer
+validate-schema: ; $(PYTHON) -m data.semantic
 test:            ; $(PYTHON) -m pytest tests datagen/tests -q
 eval:            ; $(PYTHON) -m eval.run_eval
 
