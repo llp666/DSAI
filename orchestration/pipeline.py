@@ -225,7 +225,11 @@ class Pipeline:
             if "error" in result_box:
                 yield "content", f"（出错了：{result_box['error']}）"
             else:
-                yield "content", result_box["result"].get("answer", "")
+                # typewriter: hand the final answer to the UI in small slices so it
+                # streams out smoothly instead of dumping all at once.
+                text = result_box["result"].get("answer", "")
+                for i in range(0, len(text), 12):
+                    yield "content", text[i:i + 12]
 
         return result_box, _stream()
 

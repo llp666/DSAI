@@ -7,10 +7,10 @@ Business logic (state machine / casual routing) is unchanged.
 
 from __future__ import annotations
 
+import time
 import uuid
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="电商智能问数 Agent",
@@ -162,6 +162,11 @@ hr{border:none;border-top:1px solid var(--hairline)}
   background:rgba(0,0,0,.02);box-shadow:none;margin:.3rem 0;
 }
 [data-testid="stExpander"] summary{font-size:.85rem;font-weight:600;color:var(--ink-2)}
+@keyframes thinkPulse{0%,100%{opacity:1}50%{opacity:.42}}
+/* live thinking panel: the open header (icon + label) blinks until the panel completes */
+[data-testid="stExpander"] summary[aria-expanded="true"]{
+  animation:thinkPulse 1.35s ease-in-out infinite;
+}
 
 /* ---------- composer: floating capsule ---------- */
 
@@ -299,28 +304,37 @@ def render_chart(result: dict) -> None:
 def _render_stream(chunks):
     """Consume tagged (reasoning, content) chunks → (answer_text, reasoning_text).
 
-    Kimi-style: model chain-of-thought streams into a collapsible 「思考过程」 panel,
-    then the answer streams below it; a status line covers the pre-LLM retrieval phase.
+    Kimi-style: the model's chain-of-thought streams into a collapsible 「思考过程」
+    panel that sits ABOVE the answer. The panel is a running st.status while thinking
+    (spinner + pulsing header keep it alive across the thinking→answer gap), then
+    collapses to a static ✓ once the answer arrives. Both streams render with a gentle
+    typewriter cadence so they don't dump at once.
     """
     status = st.empty()
     status.caption("正在检索相关数据表…")
-    think: st.delta_generator.DeltaGenerator | None = None
-    think_box = None
+    think = None          # st.status container (lazy)
+    think_box = None      # placeholder inside it (streams reasoning)
     think_text = ""
-    answer = st.empty()
+    answer = None         # lazy placeholder, created AFTER the thinking panel
     answer_text = ""
     for kind, chunk in chunks:
         if kind == "reasoning":
             if think is None:
                 status.empty()
-                think = st.expander("💭 思考过程", expanded=True)
+                think = st.status("💭 正在思考…", expanded=True)
                 think_box = think.empty()
             think_text += chunk
             think_box.markdown(think_text)
+            time.sleep(0.006)  # gentle cadence: smooth reveal, not a sudden dump
         elif kind == "content":
-            status.empty()
+            if think is not None:
+                think.update(label="💭 思考过程", state="complete", expanded=False)
+            if answer is None:
+                status.empty()
+                answer = st.empty()
             answer_text += chunk
             answer.markdown(answer_text)
+            time.sleep(0.004)
     return answer_text, think_text
 
 
@@ -351,7 +365,8 @@ def _suggest(text: str) -> None:
 
 
 def scroll_bottom() -> None:
-    components.html(
+    # st.iframe replaced st.components.v1.html (removed after 2026-06-01).
+    st.iframe(
         """
         <script>
         (function () {
@@ -364,7 +379,7 @@ def scroll_bottom() -> None:
         })();
         </script>
         """,
-        height=0,
+        height="content",
     )
 
 
@@ -426,13 +441,13 @@ def main() -> None:
     # ---- history ----
     for m in messages:
         with st.chat_message(m["role"], avatar=AVATARS[m["role"]]):
+            if m["role"] == "assistant" and m.get("reasoning"):
+                # thinking panel sits ABOVE the answer (Kimi-style)
+                with st.status("💭 思考过程", state="complete", expanded=False):
+                    st.markdown(m["reasoning"])
             st.markdown(m["content"])
-            if m["role"] == "assistant":
-                if m.get("reasoning"):
-                    with st.expander("💭 思考过程", expanded=False):
-                        st.markdown(m["reasoning"])
-                if m.get("result"):
-                    render_chart(m["result"])
+            if m["role"] == "assistant" and m.get("result"):
+                render_chart(m["result"])
 
     if ss.pop("_scroll", None):
         scroll_bottom()
