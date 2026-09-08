@@ -342,11 +342,14 @@ class DsaiGraph:
         used_tool: str | None = None
         tool_answer: str | None = None
         sq: SemanticQuery | None = None
+        reasoning_parts: list[str] = []
         upd: dict = {"messages": msgs[start:]}
         for round_i in range(self._TOOL_MAX_ROUNDS):
             content, tool_calls = llm.complete_with_tools(
                 self._tool_system_prompt(state),
                 _build_tool_user(state["question"], tool_answer), schemas)
+            if getattr(llm, "last_reasoning", None):
+                reasoning_parts.append(llm.last_reasoning)
             if not tool_calls:
                 # LLM didn't call a tool → output is a semantic-query JSON or insight-answer text
                 if _looks_like_json(content):
@@ -357,6 +360,7 @@ class DsaiGraph:
                     else:
                         if used_tool:
                             upd["tool_used"] = used_tool
+                        upd["_reasoning"] = "\n\n".join(reasoning_parts)
                         return upd, None, sq  # semantic-query path (tool info recorded)
                 else:
                     tool_answer = content or tool_answer  # plain text → insight answer
@@ -379,6 +383,7 @@ class DsaiGraph:
         if used_tool:
             upd["tool_used"] = used_tool
         upd["messages"] = msgs[start:]
+        upd["_reasoning"] = "\n\n".join(reasoning_parts)
         # tool failed and LLM didn't converge → fall back to semantic-query path (no raw error as the answer)
         if tool_answer and (tool_answer.startswith("工具调用失败") or tool_answer.startswith("Error:")):
             return upd, None, None
@@ -428,6 +433,7 @@ class DsaiGraph:
             return {"execution_error": None, "_reflect_fixed": False}
         with self._span("generate", input={"retry": state.get("retry_count")}):
             llm = self.p._get_llm(self._use_alt)
+            on_reasoning = (config or {}).get("configurable", {}).get("on_reasoning")
             # optional tool-call round (stage 3-4E): only when intent routing hits a diagnostic domain
             # (inventory/marketing funnel), avoiding an extra tools-armed LLM call for ordinary questions
             upd: dict = {}
@@ -450,12 +456,18 @@ class DsaiGraph:
                 question = (f"{question}\n\n【上次失败原因】\n{feedback}\n"
                             "请根据错误原因修正你的语义查询 JSON，只输出合法 JSON。")
             try:
-                sq, raw, attempts = self.p._generate(question, state["schema_text"], llm, today)
+                sq, raw, attempts = self.p._generate(question, state["schema_text"], llm, today,
+                                                     on_reasoning=on_reasoning)
             except BudgetExceeded:
                 raise  # budget: pass through so answer() degrades rather than swallowing it
             except Exception as e:
                 return {"semantic_query": None, "execution_error": f"LLM 调用失败: {e}"}
-            return {**upd, "semantic_query": sq, "execution_error": None}
+            # merge tool-round + generation reasoning for the thinking panel
+            reasoning = upd.get("_reasoning", "")
+            if getattr(llm, "last_reasoning", None):
+                reasoning = f"{reasoning}\n\n{llm.last_reasoning}".strip()
+            return {**upd, "semantic_query": sq, "execution_error": None,
+                    "_reasoning": reasoning}
 
     def tools_node(self, state: AgentState, config) -> dict:
         with self._span("tools", input={"n_errors": len(state.get("errors", []))}):
@@ -843,7 +855,8 @@ class DsaiGraph:
     # ---------- entry ----------
 
     def answer(self, question: str, *, use_alt: bool = False,
-               thread_id: str | None = None, history: list[dict] | None = None) -> dict:
+               thread_id: str | None = None, history: list[dict] | None = None,
+               on_reasoning=None) -> dict:
         today = self.cfg.reference_date or date.today().isoformat()
         state: AgentState = {
             "question": question,
@@ -873,6 +886,7 @@ class DsaiGraph:
             "tool_answer": "",
             "tool_used": "",
             "_tool_chart": "",
+            "_reasoning": "",
             "messages": [],
             "history": history or [],
             "answer": "",
@@ -886,6 +900,7 @@ class DsaiGraph:
                 "configurable": {
                     # stable per-conversation thread_id retains the message channel across turns
                     "thread_id": thread_id or uuid.uuid4().hex[:12],
+                    "on_reasoning": on_reasoning,  # live-thinking hook (chat UI); None for eval/tests
                 },
                 "recursion_limit": RECURSION_LIMIT,
             }

@@ -66,6 +66,7 @@ class AgentState(TypedDict):
     tool_answer: Optional[str]     # tool-path insight answer (from diagnostic tool, skips semantic query)
     tool_used: Optional[str]       # diagnostic tool hit (inventory_diagnostic / marketing_funnel, trace)
     _tool_chart: Optional[str]     # tool-returned Plotly figure JSON (app renders; state holds JSON string only)
+    _reasoning: str                # LLM thinking/chain-of-thought (agnes reasoning_content, frontend shows in a collapsible panel)
     messages: Annotated[list[AnyMessage], add_messages]  # tool-call message chain (ToolNode feedback)
     history: list[dict]                                   # conversation Q&A history (app-owned, injected for context)
     answer: str

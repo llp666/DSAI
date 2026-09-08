@@ -90,6 +90,16 @@ class MonitoredLLM:
         yield from self._llm.stream_complete(system, user)
         self._monitor.add_usage(self._llm.last_usage)
 
+    def complete_stream(self, system: str, user: str, *, on_reasoning=None) -> str:
+        self._monitor.record_call()
+        content = self._llm.complete_stream(system, user, on_reasoning=on_reasoning)
+        self._monitor.add_usage(self._llm.last_usage)
+        return content
+
+    @property
+    def last_reasoning(self) -> str | None:
+        return self._llm.last_reasoning
+
     @property
     def model(self) -> str:
         return self._llm.model

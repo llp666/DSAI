@@ -23,6 +23,7 @@ class LLMClient:
     """LLM adapter protocol; implementations are swappable, pipeline is vendor-agnostic."""
 
     last_usage: dict | None = None  # most recent call's token usage (for metering, optional)
+    last_reasoning: str | None = None  # most recent call's reasoning/thinking content (optional)
 
     def complete(self, system: str, user: str) -> str:
         raise NotImplementedError
@@ -33,7 +34,11 @@ class LLMClient:
         raise NotImplementedError
 
     def stream_complete(self, system: str, user: str):
-        """Stream a completion as text chunks (generator); records last_usage."""
+        """Stream a completion as tagged (kind, text) chunks: kind is 'reasoning' or 'content'."""
+        raise NotImplementedError
+
+    def complete_stream(self, system: str, user: str, *, on_reasoning=None) -> str:
+        """Full completion while forwarding live reasoning chunks to ``on_reasoning``."""
         raise NotImplementedError
 
     @property
@@ -46,6 +51,7 @@ class OpenAICompatClient(LLMClient):
         self._cfg = cfg
         self._client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=120)
         self.last_usage: dict | None = None
+        self.last_reasoning: str | None = None
 
     def complete(self, system: str, user: str) -> str:
         content, _ = self._chat(system, user, tools=None)
@@ -57,9 +63,12 @@ class OpenAICompatClient(LLMClient):
         return content, tool_calls
 
     def stream_complete(self, system: str, user: str):
-        """Stream a completion as text chunks (generator); records last_usage.
+        """Stream a completion as tagged (kind, text) chunks ('reasoning' then 'content').
 
-        429 is retried only before streaming starts (mid-stream errors propagate).
+        agnes-style models emit chain-of-thought in delta.reasoning_content before the
+        answer; chunks yield ("reasoning", t) / ("content", t) so the UI can render a
+        Kimi-style collapsible thinking panel. 429 is retried only before streaming
+        starts (mid-stream errors propagate).
         """
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -75,15 +84,22 @@ class OpenAICompatClient(LLMClient):
                     stream=True,
                 )
                 buf: list[str] = []
+                reasoning_parts: list[str] = []
                 usage = None
                 for chunk in stream:
                     delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        buf.append(delta.content)
-                        yield delta.content
+                    if delta:
+                        r = getattr(delta, "reasoning_content", None)
+                        if r:
+                            reasoning_parts.append(r)
+                            yield "reasoning", r
+                        if delta.content:
+                            buf.append(delta.content)
+                            yield "content", delta.content
                     u = getattr(chunk, "usage", None)
                     if u is not None:
                         usage = u
+                self.last_reasoning = "".join(reasoning_parts).strip() or None
                 full = "".join(buf).strip()
                 if not full:
                     raise LLMError(
@@ -106,6 +122,17 @@ class OpenAICompatClient(LLMClient):
                     f"LLM 调用失败 [{self._cfg.provider}/{self._cfg.model}]: {e}") from e
         raise LLMError(
             f"LLM 调用失败（限流重试3次仍失败）[{self._cfg.provider}/{self._cfg.model}]: {last_exc}")
+
+    def complete_stream(self, system: str, user: str, *, on_reasoning=None) -> str:
+        """Full completion (aggregated) while forwarding live reasoning to ``on_reasoning``."""
+        buf: list[str] = []
+        for kind, text in self.stream_complete(system, user):
+            if kind == "reasoning":
+                if on_reasoning is not None:
+                    on_reasoning(text)
+            else:
+                buf.append(text)
+        return "".join(buf)
 
     def _chat(self, system: str, user: str, tools: list | None):
         """Shared chat.completions call: returns (content, tool_calls or None).
@@ -149,6 +176,7 @@ class OpenAICompatClient(LLMClient):
         }
         msg = resp.choices[0].message
         content = (msg.content or "").strip()
+        self.last_reasoning = (getattr(msg, "reasoning_content", None) or "").strip() or None
         tool_calls = None
         if getattr(msg, "tool_calls", None):
             tool_calls = []

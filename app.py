@@ -156,6 +156,13 @@ hr{border:none;border-top:1px solid var(--hairline)}
 }
 [data-testid="stSpinner"]{color:var(--ink-2)}
 
+/* thinking panel (Kimi-style collapsible) */
+[data-testid="stExpander"]{
+  border:1px solid var(--hairline);border-radius:14px;
+  background:rgba(0,0,0,.02);box-shadow:none;margin:.3rem 0;
+}
+[data-testid="stExpander"] summary{font-size:.85rem;font-weight:600;color:var(--ink-2)}
+
 /* ---------- composer: floating capsule ---------- */
 
 [data-testid="stBottom"],
@@ -289,6 +296,34 @@ def render_chart(result: dict) -> None:
         st.caption(f"（图表渲染失败：{e}）")
 
 
+def _render_stream(chunks):
+    """Consume tagged (reasoning, content) chunks → (answer_text, reasoning_text).
+
+    Kimi-style: model chain-of-thought streams into a collapsible 「思考过程」 panel,
+    then the answer streams below it; a status line covers the pre-LLM retrieval phase.
+    """
+    status = st.empty()
+    status.caption("正在检索相关数据表…")
+    think: st.delta_generator.DeltaGenerator | None = None
+    think_box = None
+    think_text = ""
+    answer = st.empty()
+    answer_text = ""
+    for kind, chunk in chunks:
+        if kind == "reasoning":
+            if think is None:
+                status.empty()
+                think = st.expander("💭 思考过程", expanded=True)
+                think_box = think.empty()
+            think_text += chunk
+            think_box.markdown(think_text)
+        elif kind == "content":
+            status.empty()
+            answer_text += chunk
+            answer.markdown(answer_text)
+    return answer_text, think_text
+
+
 def _conversation_history(messages: list[dict]) -> list[dict]:
     """Pair consecutive user→assistant turns into the agent's history [{question, answer}]."""
     history = []
@@ -392,8 +427,12 @@ def main() -> None:
     for m in messages:
         with st.chat_message(m["role"], avatar=AVATARS[m["role"]]):
             st.markdown(m["content"])
-            if m["role"] == "assistant" and m.get("result"):
-                render_chart(m["result"])
+            if m["role"] == "assistant":
+                if m.get("reasoning"):
+                    with st.expander("💭 思考过程", expanded=False):
+                        st.markdown(m["reasoning"])
+                if m.get("result"):
+                    render_chart(m["result"])
 
     if ss.pop("_scroll", None):
         scroll_bottom()
@@ -420,20 +459,22 @@ def main() -> None:
             st.markdown(prompt)
 
         with st.chat_message("assistant", avatar=AVATARS["assistant"]):
-            result: dict = {}
+            result_box: dict = {}
+            reasoning = ""
             try:
-                with st.spinner("Agent年思考中…"):
-                    result, chunks = pipeline.chat_stream(
-                        prompt, history=history, thread_id=conv["thread_id"]
-                    )
-                full = st.write_stream(chunks)
+                _, chunks = pipeline.chat_stream(
+                    prompt, history=history, thread_id=conv["thread_id"], result_box=result_box
+                )
+                full, reasoning = _render_stream(chunks)
+                result = result_box.get("result", {})
             except Exception as e:
                 full = f"（出错了：{e}）"
                 st.markdown(full)
                 result = {}
             render_chart(result)
 
-        messages.append({"role": "assistant", "content": full, "result": result})
+        messages.append({"role": "assistant", "content": full,
+                         "reasoning": reasoning, "result": result})
         ss._scroll = True
         st.rerun()
 

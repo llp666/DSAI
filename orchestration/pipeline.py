@@ -8,7 +8,9 @@ Full flow traced via Langfuse (retrieve / generate / compile / execute spans).
 from __future__ import annotations
 
 import json
+import queue
 import re
+import threading
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -105,7 +107,7 @@ class Pipeline:
         return SemanticQuery.model_validate_json(text)
 
     def _generate(self, question: str, schema_text: str, llm: LLMClient,
-                  today: str) -> tuple[SemanticQuery | None, str | None, int]:
+                  today: str, on_reasoning=None) -> tuple[SemanticQuery | None, str | None, int]:
         system = build_system_prompt(self.layer, schema_text, today)
         last_error: str | None = None
         for attempt in range(2):  # first try + 1 retry
@@ -114,7 +116,10 @@ class Pipeline:
                 "请只输出符合格式要求的合法 JSON。"
             )
             try:
-                raw = llm.complete(system, user)
+                if on_reasoning is not None:
+                    raw = llm.complete_stream(system, user, on_reasoning=on_reasoning)
+                else:
+                    raw = llm.complete(system, user)
                 return self._parse_semantic_query(raw), raw, attempt
             except (ValidationError, json.JSONDecodeError) as e:
                 last_error = str(e)
@@ -173,37 +178,71 @@ class Pipeline:
 
     # ---------- main entry (stage 3: delegate to the LangGraph state machine) ----------
     def answer(self, question: str, *, use_alt: bool = False,
-               thread_id: str | None = None, history: list[dict] | None = None) -> dict:
+               thread_id: str | None = None, history: list[dict] | None = None,
+               on_reasoning=None) -> dict:
         if self._graph is None:
             self._graph = DsaiGraph(self)
         return self._graph.answer(question, use_alt=use_alt,
-                                  thread_id=thread_id, history=history)
+                                  thread_id=thread_id, history=history,
+                                  on_reasoning=on_reasoning)
 
     def answer_stream(self, question: str, *, use_alt: bool = False,
                       thread_id: str | None = None,
-                      history: list[dict] | None = None):
-        """Run the pipeline and return (result, chunks): ``chunks`` streams the answer text.
+                      history: list[dict] | None = None,
+                      result_box: dict | None = None):
+        """Stream a business question as tagged (reasoning, content) chunks (Kimi-style).
 
-        The deterministic pipeline runs to completion first; the final answer is then rewritten +
-        streamed by the LLM from the grounded result. Tool-insight, degrade and empty answers are
-        echoed verbatim (no second LLM call).
+        Returns (result_box, chunks): ``result_box`` (a dict, created if omitted) is filled with
+        the final state-machine result when streaming ends; ``chunks`` is a generator of tagged
+        chunks. The state machine runs in a background thread; its live chain-of-thought is
+        pumped through a queue so the UI can render a collapsible thinking panel while the answer
+        is still being generated.
         """
-        result = self.answer(question, use_alt=use_alt, thread_id=thread_id, history=history)
-        return result, self._answer_chunks(result)
+        if result_box is None:
+            result_box = {}
+        q: queue.Queue = queue.Queue()
+
+        def _hook(chunk: str) -> None:
+            q.put(("reasoning", chunk))
+
+        def _run() -> None:
+            try:
+                result_box["result"] = self.answer(
+                    question, use_alt=use_alt, thread_id=thread_id,
+                    history=history, on_reasoning=_hook)
+            except Exception as e:  # surface errors as the final content chunk
+                result_box["error"] = e
+            finally:
+                q.put(("_done", None))
+
+        def _stream():
+            threading.Thread(target=_run, daemon=True).start()
+            while True:
+                kind, text = q.get()
+                if kind == "_done":
+                    break
+                yield kind, text
+            if "error" in result_box:
+                yield "content", f"（出错了：{result_box['error']}）"
+            else:
+                yield "content", result_box["result"].get("answer", "")
+
+        return result_box, _stream()
 
     def chat_stream(self, question: str, *, thread_id: str | None = None,
-                    history: list[dict] | None = None):
+                    history: list[dict] | None = None, result_box: dict | None = None):
         """Chat entry: route business questions to the state machine, casual talk to plain LLM chat.
 
-        Returns (result, chunks): ``result`` is the deterministic state-machine result for business
-        questions (or {} for casual), ``chunks`` streams the answer text.
+        Returns (result_box, chunks): ``result_box`` is filled with the state-machine result for
+        business questions ({} for casual); ``chunks`` yields tagged (reasoning, content) chunks.
         """
         if route_dialogue(question) == "business":
-            return self.answer_stream(question, thread_id=thread_id, history=history)
+            return self.answer_stream(question, thread_id=thread_id, history=history,
+                                      result_box=result_box)
         return {}, self._casual_chunks(question, history)
 
     def _casual_chunks(self, question: str, history: list[dict] | None = None):
-        """Stream a plain conversational reply (no semantic query / SQL)."""
+        """Stream a plain conversational reply (no semantic query / SQL); yields tagged chunks."""
         system = (
             "你是「电商智能问数 Agent」，一个面向电商业务数据的智能问答助手，"
             "能帮用户查询 GMV、销售额、订单、库存等经营指标。\n"
@@ -216,10 +255,6 @@ class Pipeline:
         hist = render_history(history)
         user = question if not hist else f"对话历史：\n{hist}\n\n当前问题：{question}"
         yield from self._get_llm(False).stream_complete(system, user)
-
-    def _answer_chunks(self, result: dict):
-        """Yield the deterministic answer verbatim (tool insight / normal / degrade all ship)."""
-        yield result.get("answer", "")
 
 
 def run_one(question: str, *, cfg: Config | None = None, use_alt: bool = False) -> dict:
