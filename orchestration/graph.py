@@ -40,6 +40,7 @@ from tools.contract import ToolError, serialize_result
 from orchestration.tool_router import route_tool_intent
 from tools.inventory import inventory_diagnostic_tool
 from tools.marketing import marketing_roi_funnel_tool
+from tools.search import SEARCH_ARGS_SCHEMA
 from compile.types import AgentState, SemanticQuery
 
 # retrieval injection token budget (1/8 of agnes 128k maxInput, leaving room for instruction/answer)
@@ -255,6 +256,16 @@ class DsaiGraph:
             except ToolError as e:
                 content = f"Error: {e.as_text()}"
             return (content if content.startswith("Error:") else None), content
+        if name == "search_tool":
+            from tools.search import web_search_tool
+
+            if self.cfg.search is None:
+                return "搜索未配置（请在 .env 中设置 SEARCH_API_KEY）", None
+            try:
+                content = serialize_result(web_search_tool(self.cfg.search, args))
+            except ToolError as e:
+                content = f"Error: {e.as_text()}"
+            return (content if content.startswith("Error:") else None), content
         call = AIMessage(content="", tool_calls=[{
             "name": name, "args": args, "id": f"call_{name}_{len(msgs)}", "type": "tool_call",
         }])
@@ -291,6 +302,14 @@ class DsaiGraph:
                                 "用于「投放漏斗」「转化链路」类问题。"),
                 "parameters": MARKETING_ARGS_SCHEMA,
             }},
+            {"type": "function", "function": {
+                "name": "search_tool",
+                "description": ("网页搜索工具：输入 query，返回相关网页的标题/链接/摘要。"
+                                "用于实时/资讯类问题（天气、新闻、最新资讯、汇率、股价、热点等），"
+                                "或需要当前信息才能回答的问题；调用后基于返回结果回答并附「信息来源」。"
+                                "业务指标问题（GMV/销量/库存…）不要调用。"),
+                "parameters": SEARCH_ARGS_SCHEMA,
+            }},
         ]
 
     _TOOL_MAX_ROUNDS = 2  # cap on in-generate tool-call loops (against agnes duplicate tool_calls burning tokens)
@@ -307,6 +326,8 @@ class DsaiGraph:
             "- 聚合计数题（如「断货 SKU 数是多少」「有多少 SKU 断货」「库存预警 SKU 数」）要的是一个总数，"
             "不是 SKU 明细 → 不要调用 inventory_tool，直接输出语义查询 JSON（指标 stockout_skus_count）。\n"
             "- marketing_tool 只用于投放漏斗/转化链路（曝光→点击→加购→支付分环节转化）。\n"
+            "- search_tool 只用于实时/资讯类问题（天气/新闻/最新资讯/汇率/股价等）或需要当前信息才能回答的问题，"
+            "调用后基于返回结果回答并附「信息来源」；业务指标问题不要搜索。\n"
             "- 调用工具后，基于工具返回的真实结果，用自然语言输出洞察（可引用 sku_id/天数/环比/环节转化率）。\n"
             "- 工具报错/未实现/不足以回答 → 放弃工具，改输出下方「输出格式」的语义查询 JSON（引用已定义指标）。\n"
             "- 没有任何真实数据来源时禁止编造数字；无法回答就明确说明，绝不猜数。\n\n"

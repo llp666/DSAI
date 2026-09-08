@@ -83,6 +83,45 @@ def _sanitize_reasoning(chunk: str) -> str | None:
     return chunk
 
 
+# ---- trivial casual fast-path: 你好/hi/谢谢/再见 → instant canned reply (zero LLM latency) ----
+# Whole-string short forms only: anything carrying a real request (「你好，帮我查下GMV」) falls
+# through to the tool round. This kills the "still hangs a moment before replying" gap for the
+# simplest chats the user called out, without touching the needs-thinking casual path.
+_GREETING_RE = re.compile(
+    r"^(?:你好|您好|哈喽|嗨|hello|hi|hey|早上好|下午好|晚上好|在吗|在不在)[呀啊哈!！。~～.…、\s]*$",
+    re.IGNORECASE)
+_THANKS_RE = re.compile(
+    r"^(?:谢谢|感谢|多谢|thanks|thank you|谢谢啦|谢谢你|辛苦啦)[!！。~～.…、\s]*$",
+    re.IGNORECASE)
+_BYE_RE = re.compile(
+    r"^(?:再见|拜拜|晚安|bye|回聊)[!！。~～.…、\s]*$",
+    re.IGNORECASE)
+
+_GREETING_REPLY = (
+    "你好！我是电商智能问数 Agent，可以帮你查 GMV、销售额、订单、库存、营销 ROI 等经营数据。"
+    "想查点什么？比如「上个月 GMV 是多少」或者「哪些 SKU 断货了」。"
+)
+_THANKS_REPLY = "不客气！有 GMV、销量、库存、广告投放等问题随时问我～"
+_BYE_REPLY = "再见！有数据问题随时来找我 👋"
+
+
+def _trivial_reply(question: str) -> str | None:
+    """Instant canned reply for a pure greeting/thanks/goodbye (no LLM call → no gap).
+
+    Returns None when the message isn't trivially short — it then goes through the real
+    chat path (thinking + optional search_tool)."""
+    q = question.strip()
+    if not q:
+        return None
+    if _THANKS_RE.fullmatch(q):
+        return _THANKS_REPLY
+    if _BYE_RE.fullmatch(q):
+        return _BYE_REPLY
+    if _GREETING_RE.fullmatch(q):
+        return _GREETING_REPLY
+    return None
+
+
 class Pipeline:
     def __init__(self, cfg: Config | None = None):
         self.cfg = cfg or load_config()
@@ -287,52 +326,73 @@ class Pipeline:
 
     def chat_stream(self, question: str, *, thread_id: str | None = None,
                     history: list[dict] | None = None, result_box: dict | None = None):
-        """Chat entry: business → state machine; real-time → web search; casual → plain LLM chat.
+        """Chat entry: business → state machine; casual (incl. real-time questions) → LLM chat.
 
         Returns (result_box, chunks): ``result_box`` is filled with the state-machine result for
-        business questions ({} for search/casual); ``chunks`` yields tagged (reasoning, content)
-        chunks. Only business questions carry phase/reasoning — search & casual stream content
-        straight out (no retrieval chain, no thinking panel).
+        business questions ({} for casual); ``chunks`` yields tagged (reasoning, content) chunks.
+        Real-time questions (天气/新闻/汇率…) are the LLM's call inside the casual tool round —
+        no keyword route reaches the search API anymore (stage 3-5).
         """
         route = route_dialogue(question)
         if route == "business":
             return self.answer_stream(question, thread_id=thread_id, history=history,
                                       result_box=result_box)
-        if route == "search":
-            return {}, self._search_chunks(question, history)
         return {}, self._casual_chunks(question, history)
 
     def _casual_chunks(self, question: str, history: list[dict] | None = None):
-        """Stream a plain conversational reply (no semantic query / SQL); yields tagged chunks.
+        """Stream a casual reply (no semantic query / SQL); yields tagged (reasoning, content) chunks.
 
-        Casual chat is NOT a business question: it skips the retrieve→think→answer chain.
-        Thinking is disabled at the provider (chat_template_kwargs per docs/model.md) so the
-        reply is fast, and only content chunks are yielded — no reasoning panel, no chance of
-        the system prompt ("对话规则") leaking into the visible reply.
+        Two tiers:
+        - 简单问候（你好/hi/谢谢/再见…）→ 0 LLM 延迟的即时回复：不调模型、无思考面板、无 gap;
+        - 需要真正回答的闲聊 → thinking 开启的流式对话（思考过程展示在面板里，② 防泄漏），
+          且工具轮让 LLM 自主决定是否调用 search_tool 查实时信息（③ 从关键词路由改为 LLM 决策）。
         """
+        instant = _trivial_reply(question)
+        if instant is not None:
+            yield "content", instant
+            return
+        yield "phase", "正在思考…"
         system = (
             "你是「电商智能问数 Agent」，一个面向电商业务数据的智能问答助手，"
-            "能帮用户查询 GMV、销售额、订单、库存等经营指标。\n"
+            "能帮用户查询 GMV、销售额、订单、库存等经营指标，也能联网查实时/资讯类问题。\n"
             "对话规则：\n"
             "- 始终以「电商智能问数 Agent」自称，绝不透露底层模型名称或厂商身份（如 agnes、OpenAI 等）。\n"
             "- 友好、简洁地回答问候、闲聊、自我介绍、功能帮助类问题。\n"
+            "- 若问题需要当前/实时信息（天气、新闻、最新资讯、汇率、股价、热点等），"
+            "调用 search_tool 搜索后再回答，并附上「信息来源」。\n"
             "- 若用户提到数据或指标但表述不明确，引导其说清要查询的指标与时间范围。\n"
             "- 不编造任何数据或数字；涉及具体数值的问题交由数据查询链路回答。"
         )
         hist = render_history(history)
         user = question if not hist else f"对话历史：\n{hist}\n\n当前问题：{question}"
-        # no_thinking speeds the reply up at the API level; the content-only filter is
-        # defensive — even a provider that ignores the toggle never yields reasoning here.
-        for kind, text in self._get_llm(False).stream_complete(system, user, no_thinking=True):
-            if kind == "content":
+        from tools.search import search_tool_schema
+
+        llm = self._get_llm(False)
+        # thinking 开启（有需要思考的闲聊展示思考过程），reasoning 经防泄漏过滤
+        for kind, text in llm.stream_complete_with_tools(system, user, [search_tool_schema()]):
+            if kind == "reasoning":
+                cleaned = _sanitize_reasoning(text)
+                if cleaned is not None:
+                    yield kind, cleaned
+            else:
                 yield kind, text
+        # LLM 自主选择了 search_tool → 用它的 query 联网搜索并按来源摘要回答
+        query = None
+        for tc in (getattr(llm, "last_tool_calls", None) or []):
+            if tc.get("name") == "search_tool":
+                query = (tc.get("arguments") or {}).get("query") or None
+                if query:
+                    break
+        if query:
+            yield from self._search_chunks(question, history, query=query)
 
-    def _search_chunks(self, question: str, history: list[dict] | None = None):
-        """Real-time questions (天气/新闻/最新资讯…) → web search, then a sourced LLM summary.
+    def _search_chunks(self, question: str, history: list[dict] | None = None,
+                       *, query: str | None = None):
+        """Web-search a reply grounded in live keenable results, then a sourced LLM summary.
 
-        Same fast path as casual (content-only, thinking off), but grounded in live keenable
-        search results — the search API is documented in docs/model.md (stage-3 reserved) and
-        configured via SEARCH_API_KEY / SEARCH_BASE_URL. Degrades to an honest reply when the
+        Entered when the LLM autonomously chose search_tool (stage 3-5) — not a keyword route.
+        ``query`` is the LLM's chosen search term (falls back to the original question). Same
+        fast path as casual (content-only, thinking off); degrades to an honest reply when the
         API is unconfigured or the query fails.
         """
         from tools.search import web_search
@@ -343,8 +403,9 @@ class Pipeline:
             yield "content", ("（暂时无法回答实时问题：未配置搜索 API，"
                               "请在 .env 中设置 SEARCH_API_KEY）")
             return
+        q = query or question
         try:
-            results = web_search(question, cfg)
+            results = web_search(q, cfg)
         except ToolError as e:
             yield "content", f"（搜索失败：{e.as_text()}）"
             return
@@ -355,13 +416,13 @@ class Pipeline:
             f"- {r['title']} | {r['url']}\n  {r['snippet']}" for r in results
         )
         system = (
-            "你是电商智能问数 Agent。用户问了一个实时/资讯类问题，下面是网页搜索结果。\n"
+            "你是电商智能问数 Agent。用户的问题需要联网实时信息，下面是网页搜索结果。\n"
             "请基于搜索结果，用自然语言简洁、准确地回答用户问题；\n"
             "- 在回答末尾附上「信息来源」列表（标题 + 链接）。\n"
             "- 若搜索结果不足以回答，如实说明，绝不编造。"
         )
         hist = render_history(history)
-        user = f"问题：{question}\n\n网页搜索结果：\n{sources}"
+        user = f"问题：{q}\n\n网页搜索结果：\n{sources}"
         if hist:
             user = f"对话历史：\n{hist}\n\n{user}"
         for kind, text in self._get_llm(False).stream_complete(system, user, no_thinking=True):
