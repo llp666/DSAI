@@ -1,11 +1,11 @@
-"""orchestration/error_classifier.py：错误三分类（阶段 3-2 轨道 A 核心）。
+"""orchestration/error_classifier.py：error three-way classification (stage-3-2 track A).
 
-把工具链产生的真实错误文本分类，决定修复策略：
-- dialect（方言错）：Parser Error / syntax error / BETWEEN 边界 → 确定性映射表（try_repair），零 LLM
-- reference（引用错）：未知维度/未知指标/未知表/BinderError → 回灌命中表 Schema + 可选维度列表，LLM 重写语义查询
-- logic（逻辑错）：Conversion / Could not convert（脏枚举/类型不匹配）→ 回灌指标表达式 + 关系定义，LLM 重写
+Classifies real tool errors to pick a repair strategy:
+- dialect  → Parser/syntax/BETWEEN boundary errors → deterministic rule table (try_repair), zero LLM
+- reference → unknown dimension/metric/table/BinderError → feed hit-table schema + dim list, LLM rewrites query
+- logic    → Conversion errors (dirty enum / type mismatch) → feed metric expression + relationships, LLM rewrites
 
-分类器纯函数、无外部依赖，可单测。
+Pure functions, no external deps, unit-testable.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Literal
 
 ErrorCategory = Literal["dialect", "reference", "logic", "unknown"]
 
-# 引用错特征词（编译器/执行器抛出的实体缺失类错误）
+# reference-error signatures (missing-entity errors thrown by compiler/executor)
 REFERENCE_PATTERNS = [
     re.compile(r"未知维度[：:]\s*([\w]+)"),
     re.compile(r"未知指标[：:]\s*([\w]+)"),
@@ -27,7 +27,7 @@ REFERENCE_PATTERNS = [
     re.compile(r"referenced column", re.I),
 ]
 
-# 逻辑错特征词（数据值/类型语义类错误）
+# logic-error signatures (value/type semantic errors)
 LOGIC_PATTERNS = [
     re.compile(r"Could not convert string", re.I),
     re.compile(r"Conversion Error", re.I),
@@ -37,7 +37,7 @@ LOGIC_PATTERNS = [
     re.compile(r"cast from", re.I),
 ]
 
-# 方言错特征词（语法/方言差异类）
+# dialect-error signatures (syntax / dialect differences)
 DIALECT_PATTERNS = [
     re.compile(r"Parser Error", re.I),
     re.compile(r"syntax error", re.I),
@@ -49,28 +49,24 @@ DIALECT_PATTERNS = [
 @dataclass
 class Classification:
     category: ErrorCategory
-    entity: str | None = None  # 引用错：被引用的未知实体名（维度/指标/表）
-    reason: str = ""            # 判定依据（命中的模式描述）
+    entity: str | None = None  # reference error: the unknown entity name (dim/metric/table)
+    reason: str = ""            # matched-pattern description
 
 
 def classify_error(error: str, sql: str = "") -> Classification:
-    """把工具错误文本分类为 dialect / reference / logic / unknown。
-
-    error：真实错误文本（ToolMessage「Error: …」的 content）；
-    sql：出错时的 SQL（方言错判定依赖 BETWEEN 等特征）。
-    """
+    """Classify a tool error as dialect / reference / logic / unknown."""
     text = error or ""
-    # 1) 方言错：语法类错误优先（BETWEEN 边界是编译器产出，先于枚举转换判定）
+    # 1) dialect: syntax errors first (BETWEEN boundary is compiler output, before enum conversion)
     if any(p.search(text) for p in DIALECT_PATTERNS) or "BETWEEN" in text and (
             "conversion" in text.lower() or "syntax" in text.lower()):
         return Classification("dialect", reason="语法/方言错")
-    # 2) 引用错：实体缺失类
+    # 2) reference: missing entity
     for pat in REFERENCE_PATTERNS:
         m = pat.search(text)
         if m:
             return Classification("reference", entity=m.group(1) or "",
                                   reason=f"引用错（{pat.pattern[:30]}）")
-    # 3) 逻辑错：数据值/类型语义类
+    # 3) logic: data value / type semantic error
     for pat in LOGIC_PATTERNS:
         if pat.search(text):
             return Classification("logic", reason=f"逻辑错（{pat.pattern[:30]}）")
@@ -78,16 +74,12 @@ def classify_error(error: str, sql: str = "") -> Classification:
 
 
 def format_available_dimensions(layer) -> str:
-    """构造可用维度清单（引用错回灌时告诉 LLM 哪些维度可选）。"""
-    lines = []
-    for name, d in layer.dimensions.items():
-        vals = " / ".join(str(v) for v in d["values"])
-        lines.append(f"- {name}（{d['display_name']}，表 {d['table']}.{d['column']}）：可选值 {vals}")
-    return "\n".join(lines) if lines else "（无可用维度）"
+    """Render the available-dimension list for reference-error repair prompts."""
+    return layer.format_dimensions(with_location=True) or "（无可用维度）"
 
 
 def format_metric_expressions(layer, metric: str) -> str:
-    """构造指标表达式与关系定义（逻辑错回灌时让 LLM 理解口径）。"""
+    """Render a metric's expression + relationships for logic-error repair prompts."""
     if metric not in layer.metrics:
         return f"（指标 {metric} 不存在）"
     m = layer.metrics[metric]
@@ -112,11 +104,7 @@ def format_metric_expressions(layer, metric: str) -> str:
 
 def build_repair_prompt(question: str, metric: str, category: ErrorCategory,
                         error: str, layer, feedback: str) -> tuple[str, str]:
-    """构造分类专用修复 prompt。返回 (system, user)。
-
-    引用错：注入可用维度清单，让 LLM 用合法维度重写语义查询；
-    逻辑错：注入指标表达式与关系，让 LLM 修正过滤值/口径后重写。
-    """
+    """Build a category-specific repair prompt. Returns (system, user)."""
     if category == "reference":
         dims = format_available_dimensions(layer)
         system = (

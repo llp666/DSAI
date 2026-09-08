@@ -18,3 +18,7 @@ __pycache__/
 # 评测产物
 eval/reports/
 eval/results/
+
+# graphify skill 缓存
+graphify-out/
+

@@ -1,108 +1,61 @@
-"""tracing.py：可观测性适配层。
+"""tracing.py：observability adapter.
 
-- LangfuseTracer：Langfuse 4.x SDK（observation 风格）全链路埋点；
-- NoopTracer：未启用 Langfuse 时的降级实现，接口一致、不阻塞 pipeline。
+- NullTracer: no-op fallback when Langfuse is disabled (same interface).
+- LangfuseTracer: Langfuse 4.x full tracing.
 
-统一接口：
-    with tracer.trace("question:1") as t:
-        t.set_trace_io(input=..., output=...)
-        with t.span("retrieve"): ...
-        with t.generation("generate", model=..., input=..., output=..., usage=...): ...
+Interface: ``with tracer.trace(name) as t:`` → ``t.set_trace_io(...)`` / ``t.span(...)`` / ``t.trace_id``.
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Any, Iterator
 
 
-class TraceSession:
-    def __enter__(self) -> "TraceSession":
-        raise NotImplementedError
+class NullTracer:
+    """No-op tracer used when Langfuse is not enabled."""
 
-    def __exit__(self, *exc) -> None:
-        raise NotImplementedError
-
-    @property
-    def trace_id(self) -> str:
-        raise NotImplementedError
-
-    def set_trace_io(self, *, input: Any = None, output: Any = None) -> None:
-        raise NotImplementedError
-
-    def span(self, name: str, *, input: Any = None, output: Any = None,
-             metadata: Any = None) -> Any:
-        raise NotImplementedError
-
-    def generation(self, name: str, *, model: str | None = None,
-                   input: Any = None, output: Any = None, usage: dict | None = None,
-                   metadata: Any = None) -> Any:
-        raise NotImplementedError
+    def trace(self, name: str):
+        return _NullSession()
 
 
-class _Noop:
+class _NullSession:
+    trace_id = ""
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc) -> None:
+        return None
+
+    def set_trace_io(self, **kwargs) -> None:
         pass
 
-
-class NoopTracer:
-    def trace(self, name: str) -> TraceSession:
-        return NoopSession(name)
-
-
-class NoopSession(TraceSession):
-    def __init__(self, name: str):
-        self._tid = ""
-
-    def __enter__(self) -> "NoopSession":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        pass
-
-    @property
-    def trace_id(self) -> str:
-        return self._tid
-
-    def set_trace_io(self, *, input=None, output=None) -> None:
-        pass
-
-    def span(self, name, *, input=None, output=None, metadata=None):
-        return _Noop()
-
-    def generation(self, name, *, model=None, input=None, output=None,
-                   usage=None, metadata=None):
-        return _Noop()
+    def span(self, name: str, **kwargs):
+        return nullcontext()
 
 
 class LangfuseTracer:
     def __init__(self, host: str, public_key: str, secret_key: str):
         from langfuse import Langfuse
 
-        self._lf = Langfuse(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-            timeout=30,
-        )
+        self._lf = Langfuse(public_key=public_key, secret_key=secret_key,
+                            host=host, timeout=30)
 
-    def trace(self, name: str) -> TraceSession:
-        return LangfuseSession(self._lf, name)
+    def trace(self, name: str):
+        return _LangfuseSession(self._lf, name)
 
 
-class LangfuseSession(TraceSession):
+class _LangfuseSession:
     def __init__(self, lf, name: str):
         self._lf = lf
         self._name = name
         self._root = None
+        self._root_cm = None
 
-    def __enter__(self) -> "LangfuseSession":
-        cm = self._lf.start_as_current_observation(name=self._name, as_type="span")
-        self._root = cm.__enter__()  # 进入后的 observation 对象（有 set_trace_io/update）
-        self._root_cm = cm  # 原始 context manager（用于正确退出）
+    def __enter__(self):
+        self._root_cm = self._lf.start_as_current_observation(
+            name=self._name, as_type="span")
+        self._root = self._root_cm.__enter__()
         return self
 
     def __exit__(self, *exc) -> None:
@@ -117,25 +70,14 @@ class LangfuseSession(TraceSession):
         if self._root is not None:
             self._root.set_trace_io(input=input, output=output)
 
-    def span(self, name, *, input=None, output=None, metadata=None):
+    def span(self, name: str, *, input=None, output=None, metadata=None):
         return self._lf.start_as_current_observation(
-            name=name, as_type="span", input=input, output=output, metadata=metadata
-        )
-
-    def generation(self, name, *, model=None, input=None, output=None,
-                   usage=None, metadata=None):
-        return self._lf.start_as_current_observation(
-            name=name, as_type="generation", model=model,
-            input=input, output=output, usage_details=usage, metadata=metadata,
-        )
+            name=name, as_type="span", input=input, output=output, metadata=metadata)
 
 
-def build_tracer(cfg) -> Any:
-    """按配置返回 Tracer；未启用/缺凭据时降级为 Noop。"""
+def build_tracer(cfg):
+    """Return a tracer; fall back to NullTracer when Langfuse is off / missing creds."""
     if not cfg.langfuse_enabled or not cfg.langfuse_host:
-        return NoopTracer()
-    return LangfuseTracer(
-        host=cfg.langfuse_host,
-        public_key=cfg.langfuse_public_key,
-        secret_key=cfg.langfuse_secret_key,
-    )
+        return NullTracer()
+    return LangfuseTracer(host=cfg.langfuse_host, public_key=cfg.langfuse_public_key,
+                          secret_key=cfg.langfuse_secret_key)

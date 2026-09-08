@@ -1,14 +1,14 @@
-"""config.py：环境变量加载与配置（.env 支持，无 dotenv 依赖）。"""
+"""config.py：environment loading & config (.env support, no dotenv dependency)."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def load_dotenv(path: str | Path = PROJECT_ROOT / ".env") -> None:
-    """极简 .env 解析：KEY=VALUE，忽略注释与空行，不覆盖已存在的环境变量。"""
+    """Minimal .env parser: KEY=VALUE, skips comments/blanks, never overrides existing env vars."""
     p = Path(path)
     if not p.exists():
         return
@@ -85,28 +85,23 @@ def _llm_from_env(prefix: str) -> LLMConfig | None:
     )
 
 
+def _embedding_from_env(prefix: str, default_provider: str) -> EmbeddingConfig | None:
+    emb = EmbeddingConfig(
+        provider=os.environ.get(f"{prefix}_PROVIDER", default_provider),
+        base_url=os.environ.get(f"{prefix}_BASE_URL", ""),
+        api_key=os.environ.get(f"{prefix}_API_KEY", ""),
+        model=os.environ.get(f"{prefix}_MODEL", ""),
+        dimensions=int(os.environ.get(f"{prefix}_DIMENSIONS", "1024")),
+        instruction=os.environ.get(f"{prefix}_INSTRUCTION", ""),
+        task=os.environ.get(f"{prefix}_TASK", "retrieval.query"),
+        chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
+    )
+    return emb if emb.api_key and emb.model else None
+
+
 def load_config(env_path: str | Path | None = None) -> Config:
     load_dotenv(env_path or PROJECT_ROOT / ".env")
     langfuse_enabled = os.environ.get("LANGFUSE_ENABLED", "false").lower() == "true"
-    emb = EmbeddingConfig(
-        provider=os.environ.get("EMBEDDING_PROVIDER", "gitee"),
-        base_url=os.environ.get("EMBEDDING_BASE_URL", ""),
-        api_key=os.environ.get("EMBEDDING_API_KEY", ""),
-        model=os.environ.get("EMBEDDING_MODEL", ""),
-        dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1024")),
-        instruction=os.environ.get("EMBEDDING_INSTRUCTION", ""),
-        task=os.environ.get("EMBEDDING_TASK", "retrieval.query"),
-        chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
-    )
-    alt_emb = EmbeddingConfig(
-        provider=os.environ.get("ALT_EMBEDDING_PROVIDER", "jina"),
-        base_url=os.environ.get("ALT_EMBEDDING_BASE_URL", ""),
-        api_key=os.environ.get("ALT_EMBEDDING_API_KEY", ""),
-        model=os.environ.get("ALT_EMBEDDING_MODEL", ""),
-        dimensions=int(os.environ.get("ALT_EMBEDDING_DIMENSIONS", "1024")),
-        task=os.environ.get("ALT_EMBEDDING_TASK", "retrieval.query"),
-        chroma_dir=os.environ.get("CHROMA_DIR", "warehouse/chroma"),
-    )
     rerank = RerankConfig(
         base_url=os.environ.get("RERANK_BASE_URL", ""),
         api_key=os.environ.get("RERANK_API_KEY", ""),
@@ -125,12 +120,12 @@ def load_config(env_path: str | Path | None = None) -> Config:
         ),
         meta_dir=Path(os.environ.get("META_DIR", "meta")),
         reference_date=(os.environ.get("REFERENCE_DATE") or None),
-        embedding=(emb if emb.api_key and emb.model else None),
-        alt_embedding=(alt_emb if alt_emb.api_key and alt_emb.model else None),
+        embedding=_embedding_from_env("EMBEDDING", "gitee"),
+        alt_embedding=_embedding_from_env("ALT_EMBEDDING", "jina"),
         rerank=(rerank if rerank.api_key and rerank.model else None),
     )
 
 
 def resolve(path: Path) -> Path:
-    """将相对路径解析到项目根。"""
+    """Resolve a relative path against the project root."""
     return path if path.is_absolute() else PROJECT_ROOT / path

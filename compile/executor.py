@@ -1,4 +1,4 @@
-"""compile/executor.py：DuckDB 只读执行器（对齐方案"Agent 侧一律 read_only=True"）。"""
+"""compile/executor.py：DuckDB read-only executor (Agent side is always read_only=True)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import duckdb
 
 class Executor:
     def __init__(self, db_path: Path):
-        # read_only=True：生成器独占读写，Agent 侧只读消费
+        # read_only=True: the generator owns writes, the Agent only reads
         self._con = duckdb.connect(str(db_path), read_only=True)
 
     def execute(self, sql: str):
-        """执行只读查询，返回行列表。"""
+        """Run a read-only query, return the row list."""
         return self._con.execute(sql).fetchall()
 
     def fetchone(self, sql: str):
@@ -21,7 +21,7 @@ class Executor:
         return rows[0] if rows else None
 
     def explain_dry_run(self, sql: str) -> str | None:
-        """EXPLAIN 干跑：验证 SQL 可执行性（不实际执行，毫秒级），返回错误或 None。"""
+        """EXPLAIN dry-run: validate SQL executability (no data side effect), return error or None."""
         try:
             self._con.execute(f"EXPLAIN {sql}").fetchall()
             return None

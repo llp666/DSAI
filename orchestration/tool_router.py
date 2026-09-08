@@ -1,21 +1,18 @@
-"""orchestration/tool_router.py：诊断工具意图路由（阶段 3-4）。
+"""orchestration/tool_router.py：diagnostic-tool intent routing (stage 3-4).
 
-关键词规则优先 + LLM 兜底：
-- 库存诊断意图词（断货/呆滞/可售天数/补货/DOI/库存预警/周转/动销/库存体检）
-  → inventory_diagnostic_tool
-- 营销漏斗意图词（漏斗/转化链路/曝光到支付/ROI拆解/投放效果拆解）
-  → marketing_roi_funnel_tool
-- 未命中 → None（走常规语义查询链路）
+Keyword rules first + LLM fallback:
+- inventory keywords (断货/呆滞/可售天数/补货/DOI/库存预警/周转/动销/库存体检) → inventory_tool
+- marketing keywords (漏斗/转化链路/曝光到支付/ROI拆解/投放效果拆解) → marketing_tool
+- no hit → None (normal semantic-query path)
 
-命中诊断意图时，路由结果注入 state（tool_intent），generate_node 提示 LLM
-优先调用诊断工具；未命中则完全走原语义查询链路。LLM 兜底在 pipeline 层接入。
+A hit injects a routing result; the LLM fallback is wired in pipeline.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# 意图词 → 工具（顺序匹配，先命中先得）
+# aggregate-count hints (a single number → semantic query, not the SKU-level diagnostic tool)
 _COUNTING_HINT = (
     "数是多少", "数量是多少", "有多少", "多少个", "数有几个", "数量是", "一共", "总数",
 )
@@ -30,7 +27,7 @@ TOOL_INTENT_RULES: list[tuple[str, tuple[str, ...]]] = [
       "投放效果拆解", "转化路径")),
 ]
 
-# LLM 兜底判定用的工具描述（供 prompt）
+# tool descriptions for the LLM fallback prompt
 TOOL_DESCRIPTIONS = {
     "inventory_diagnostic": (
         "库存诊断工具：输入 sku_id（可选 category），计算可售天数（库存/近30天日均）、"
@@ -44,9 +41,9 @@ TOOL_DESCRIPTIONS = {
 
 @dataclass
 class ToolIntent:
-    tool: str | None        # 命中的工具名（None=走常规链路）
-    rule: str | None        # 命中的意图词（trace 用）
-    needs_llm: bool = False  # 关键词未命中，是否值得 LLM 兜底判定
+    tool: str | None        # hit tool name (None = normal path)
+    rule: str | None        # hit keyword (trace)
+    needs_llm: bool = False  # no keyword hit, but worth an LLM fallback judgment
 
     @property
     def hit(self) -> bool:
@@ -54,8 +51,9 @@ class ToolIntent:
 
 
 def route_tool_intent(question: str) -> ToolIntent:
-    """关键词规则路由：命中返回工具名；未命中返回 None（可 LLM 兜底）。"""
+    """Keyword routing: hit → tool name; miss → None (LLM fallback optional)."""
     q = question.lower()
+    # aggregate-count questions → not the SKU-level tool; let the tool-round LLM judge → SQL
     if any(w in q for w in _COUNTING_HINT):
         sku_level = any(w in q for w in ("还够卖", "能卖几天", "可售天数", "呆滞", "库存预警"))
         if not sku_level:
@@ -64,14 +62,14 @@ def route_tool_intent(question: str) -> ToolIntent:
         for w in words:
             if w.lower() in q:
                 return ToolIntent(tool=tool, rule=w)
-    # 含库存/营销领域词但未精确命中诊断意图 → 值得 LLM 兜底
+    # domain words without an exact diagnostic intent → worth an LLM fallback
     domain_hint = any(k in q for k in ("库存", "sku", "存货", "仓库", "采购", "供应商")) \
         or any(k in q for k in ("roi", "广告", "投放", "转化"))
     return ToolIntent(tool=None, rule=None, needs_llm=domain_hint)
 
 
 def llm_fallback_prompt(question: str, intent: ToolIntent) -> tuple[str, str] | None:
-    """LLM 兜底 prompt：判定问题是否该用诊断工具。未命中领域词返回 None（不调 LLM）。"""
+    """LLM fallback prompt to judge whether a diagnostic tool applies. None if not worth it."""
     if not intent.needs_llm:
         return None
     desc_lines = "\n".join(f"- {k}：{v}" for k, v in TOOL_DESCRIPTIONS.items())

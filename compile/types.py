@@ -1,4 +1,4 @@
-"""compile/types.py：语义查询 DSL（阶段二）与 AgentState（阶段三状态机）。"""
+"""compile/types.py：semantic-query DSL + AgentState (LangGraph state machine)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 try:
     from langchain_core.messages import AnyMessage
     from langgraph.graph.message import add_messages
-except ImportError:  # langgraph 未装（CI 等）时降级：messages 字段仅作普通列表
+except ImportError:  # langgraph not installed (CI etc.): fall back to plain list
     AnyMessage = Any
     def add_messages(left: Any, right: Any) -> Any:  # type: ignore[misc]
         return list(left) + list(right)
@@ -17,56 +17,56 @@ except ImportError:  # langgraph 未装（CI 等）时降级：messages 字段�
 
 class Window(BaseModel):
     type: Literal["month", "day"] = "month"
-    value: str = Field(description="窗口值：月窗口为 YYYY-MM（如 2026-07）；日窗口为 YYYY-MM-DD（如 2026-07-15）")
+    value: str = Field(description="window value: month = YYYY-MM (e.g. 2026-07), day = YYYY-MM-DD")
 
 
 class DimensionFilter(BaseModel):
-    dim: str = Field(description="维度名（语义层 dimensions 键）")
+    dim: str = Field(description="dimension name (semantic-layer dimensions key)")
     op: Literal["=", "in"] = "="
-    value: Union[str, list[str]] = Field(description="过滤值；'=' 用标量，'in' 用数组")
+    value: Union[str, list[str]] = Field(description="filter value; '=' scalar, 'in' array")
 
 
 class SemanticQuery(BaseModel):
-    """受约束语义查询（阶段二：指标 + 月窗口 + 可选维度/过滤）。"""
+    """Constrained semantic query (metric + window + optional dimensions/filters)."""
 
     model_config = ConfigDict(validate_assignment=True)
 
-    metric: str = Field(description="语义层指标名")
+    metric: str = Field(description="semantic-layer metric name")
     window: Window
-    dimensions: list[str] = Field(default_factory=list,
-                                  description="下钻维度名列表")
+    dimensions: list[str] = Field(default_factory=list, description="drill-down dimension names")
     filters: list[DimensionFilter] = Field(
-        default_factory=list, description="维度过滤条件（与 dimensions 配套）")
+        default_factory=list, description="dimension filters (paired with dimensions)")
 
 
 class AgentState(TypedDict):
     question: str
-    intent: str                    # 意图/域分类标签（营销/订单/供应链/…，judge/repair 可据此取规则）
-    stage: str                     # judge 判定结果（answer/repair/degrade/hallucination，trace 用）
-    hallucination: bool            # 相关性校验层标记：LLM 编造无关合法查询（DSL 外实体，不可修→降级）
-    intent_mismatch: bool          # 相关性校验层标记：粒度错位（要求分组/过滤但查询无维度，可修→repair）
-    preflight_kind: str            # 预检结果（pass/date/enum/granularity/cutoff）
-    preflight_reason: str          # 预检失败原因/回退建议
-    empty_result: bool             # 执行结果为空（[]/None）：走 reflect_empty 反思分支
-    _relaxed: bool                 # 空结果反思已放宽窗口（防重复放宽循环）
-    relax_attempts: int            # 放宽次数（上限防死循环）
-    schema_text: str               # Token 预算裁剪后的相关表结构文本
+    intent: str                    # intent/domain label (marketing/orders/supply-chain/...)
+    stage: str                     # judge result (answer/repair/degrade/hallucination, trace)
+    hallucination: bool            # relevance check: LLM fabricated an unrelated valid query
+    intent_mismatch: bool          # relevance check: granularity mismatch (grouping/filter asked, query has none)
+    preflight_kind: str            # preflight result (pass/date/enum/granularity/cutoff)
+    preflight_reason: str          # preflight failure reason / fallback suggestion
+    empty_result: bool             # execution returned []/None → reflect_empty branch
+    _relaxed: bool                 # reflect_empty already relaxed window (guard against loops)
+    relax_attempts: int            # relax count (cap to prevent infinite loop)
+    schema_text: str               # token-budgeted relevant table schemas
     retrieved_tables: list[str]
-    _retrieve_degraded: bool       # 检索降级标记（embedding 网络故障时关键词回退）
+    _retrieve_degraded: bool       # retrieval degraded flag (keyword fallback on embedding failure)
     semantic_query: Optional[SemanticQuery]
     compiled_sql: Optional[str]
     execution_result: Any
     execution_error: Optional[str]
-    errors: list[str]              # 累积错误文本（真实错误，回灌给 generate 重试）
-    error_categories: list[str]    # 每轮错误的三分类结果（dialect/reference/logic/unknown）
-    error_classifications: list[dict]  # 完整分类记录（category+entity+reason，进 Langfuse）
-    error_feedback: str            # 回灌上下文（repair/reflect 产出）
-    _reflect_fixed: bool           # reflect 已重写语义查询（跳过 generate 覆盖，直接重编译）
+    errors: list[str]              # accumulated real errors (fed back to generate for retry)
+    error_categories: list[str]    # per-round error three-way categories (dialect/reference/logic/unknown)
+    error_classifications: list[dict]  # full classification records (category+entity+reason, to Langfuse)
+    error_feedback: str            # feedback context (from repair/reflect)
+    _reflect_fixed: bool           # reflect rewrote the query (skip generate, recompile directly)
     retry_count: int
     max_retries: int
-    tool_answer: Optional[str]     # 诊断工具直接产出的洞察答案（走工具轨，跳过语义查询）
-    tool_used: Optional[str]       # 本次命中的诊断工具名（inventory_diagnostic / marketing_funnel，trace 用）
-    _tool_chart: Optional[str]     # 工具返回的 Plotly figure JSON（app 渲染，state 只放 JSON 化字符串）
-    messages: Annotated[list[AnyMessage], add_messages]  # 工具调用消息链（ToolNode 回灌）
+    tool_answer: Optional[str]     # tool-path insight answer (from diagnostic tool, skips semantic query)
+    tool_used: Optional[str]       # diagnostic tool hit (inventory_diagnostic / marketing_funnel, trace)
+    _tool_chart: Optional[str]     # tool-returned Plotly figure JSON (app renders; state holds JSON string only)
+    messages: Annotated[list[AnyMessage], add_messages]  # tool-call message chain (ToolNode feedback)
+    history: list[dict]                                   # conversation Q&A history (app-owned, injected for context)
     answer: str
     trace_id: str

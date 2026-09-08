@@ -1,18 +1,17 @@
-"""tools/inventory.py：库存诊断工具（阶段 3-4C）。
+"""tools/inventory.py：inventory diagnostic tool (stage 3-4C).
 
-inventory_diagnostic_tool 计算：
-- 可售天数 = 期末 on_hand_qty / 近30天日均 outbound 销量（销量来自 stock_moves）
-- DOI = 可售天数，超过阈值（默认 90）判为呆滞
-- 销量环比 = 近30天 outbound vs 前30天
-- 结论规则：可售 ≤0 → 已断货，建议立即补货；≤3 → 建议 48 小时补货；>90 → 呆滞建议清库存
-- 出参走契约三件套：data + insights + chart（Plotly DOI×环比散点象限图 JSON）
+inventory_diagnostic_tool computes:
+- sellable days = end on_hand_qty / 30-day avg daily outbound (sales from stock_moves)
+- DOI = sellable days; over threshold (default 90) → dead stock
+- sales MoM = last 30-day outbound vs prior 30-day
+- advice rules: ≤0 → stocked out (replenish now); ≤3 → replenish within 48h; >90 → clear stock; else healthy
 
-入参：
-- sku_id：可选，指定单个 SKU（否则全量，可 top_n 限制）
-- category：可选，品类过滤（category_type：服饰/电子/家居/汽配/其他）
-- as_of_date：可选，快照日期（默认最近快照日）；无当日快照取 ≤ 该日的最近快照
-- doi_threshold：呆滞阈值（默认 90）
-- top_n：返回条数上限（默认 20，按可售天数升序=最危险在前）
+Args:
+- sku_id: optional single SKU (else all, capped by top_n)
+- category: optional category filter (服饰/电子/家居/汽配/其他)
+- as_of_date: optional snapshot date (default latest); no snapshot that day → latest <= date
+- doi_threshold: dead-stock DOI threshold (default 90)
+- top_n: max rows (default 20, ascending sellable days = most at-risk first)
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from tools.contract import (
     validate_args,
 )
 
-# 入参 JSON Schema（LLM 调用时 pydantic/jsonschema 校验）
+# args JSON Schema (jsonschema-validated on LLM calls)
 INVENTORY_ARGS_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -39,12 +38,17 @@ INVENTORY_ARGS_SCHEMA: dict = {
 }
 
 DOI_THRESHOLD_DEFAULT = 90
-SELLOUT_DAYS = 30  # 销量窗口（近30天日均）
-URGENT_DAYS = 3    # 剩余可售 ≤3 天 → 48 小时补货
+SELLOUT_DAYS = 30  # sales window (last-30-day daily average)
+URGENT_DAYS = 3    # remaining sellable <= 3 days → replenish within 48h
+
+
+def _in_clause(ids: list[str]) -> str:
+    """Render an ID list as a SQL IN clause ('a','b')."""
+    return ",".join(f"'{s}'" for s in ids)
 
 
 def _recent_snapshot_date(con, as_of: str) -> str:
-    """取 ≤ as_of 的最近快照日（快照周粒度，as_of 非快照日时回退）。"""
+    """Latest snapshot date <= as_of (weekly snapshots; falls back when as_of isn't a snapshot day)."""
     row = con.execute(
         "SELECT max(snapshot_date::DATE) FROM ods.inventory_snapshot "
         "WHERE snapshot_date::DATE <= CAST(? AS DATE)", [as_of]).fetchone()
@@ -55,11 +59,11 @@ def _recent_snapshot_date(con, as_of: str) -> str:
 
 
 def _daily_avg(con, sku_ids: list[str], end: str, days: int) -> dict[str, float]:
-    """近 days 天日均 outbound 销量（stock_moves）。"""
+    """Average daily outbound over the last ``days`` days (stock_moves)."""
     if not sku_ids:
         return {}
-    placeholders = ",".join(f"'{s}'" for s in sku_ids)
-    # 日均与环比当前窗口统一为半开区间 [end-days, end)。
+    placeholders = _in_clause(sku_ids)
+    # daily avg and MoM current window are unified as half-open [end-days, end)
     rows = con.execute(
         f"SELECT sku_id, sum(qty)::DOUBLE / {days} FROM ods.stock_moves "
         f"WHERE sku_id IN ({placeholders}) AND move_type='outbound' "
@@ -70,10 +74,10 @@ def _daily_avg(con, sku_ids: list[str], end: str, days: int) -> dict[str, float]
 
 
 def _period_sales(con, sku_ids: list[str], end: str, start: str) -> dict[str, float]:
-    """[start, end) 区间 outbound 销量（环比用）。start 是已展开的日期表达式。"""
+    """Outbound volume over [start, end) (for MoM). start is an expanded date expression."""
     if not sku_ids:
         return {}
-    placeholders = ",".join(f"'{s}'" for s in sku_ids)
+    placeholders = _in_clause(sku_ids)
     rows = con.execute(
         f"SELECT sku_id, sum(qty)::DOUBLE FROM ods.stock_moves "
         f"WHERE sku_id IN ({placeholders}) AND move_type='outbound' "
@@ -85,7 +89,7 @@ def _period_sales(con, sku_ids: list[str], end: str, start: str) -> dict[str, fl
 def _category_of(con, sku_ids: list[str]) -> dict[str, str]:
     if not sku_ids:
         return {}
-    placeholders = ",".join(f"'{s}'" for s in sku_ids)
+    placeholders = _in_clause(sku_ids)
     rows = con.execute(
         f"SELECT p.sku_id, c.category_type FROM dim.products p "
         f"JOIN dim.categories c ON p.category_id=c.category_id "
@@ -94,7 +98,7 @@ def _category_of(con, sku_ids: list[str]) -> dict[str, str]:
 
 
 def _advice(days: float, mom: float | None, doi_threshold: int) -> str:
-    """结论规则：按可售天数给出补货建议。"""
+    """Advice rule by sellable days + MoM trend."""
     if days <= 0:
         return "已断货（库存耗尽），建议立即补货"
     if days <= URGENT_DAYS:
@@ -107,12 +111,12 @@ def _advice(days: float, mom: float | None, doi_threshold: int) -> str:
 
 
 def _make_scatter_chart(rows: list[dict], doi_threshold: int) -> dict:
-    """Plotly DOI×环比散点象限图（figure JSON）。"""
+    """Plotly DOI×MoM scatter-quadrant chart (figure JSON)."""
     import plotly.graph_objects as go
 
     fig = go.Figure()
-    # 环比缺失或 DOI 无意义（有库存但近30天零销量 → doi=None）的 SKU 不画点；
-    # 否则 marker 颜色比较 None 会 TypeError。
+    # skip SKUs with missing MoM or meaningless DOI (has stock but zero sales → doi=None);
+    # otherwise the marker-color None<=int comparison raises TypeError
     pts = [(r["doi_days"], r["sales_mom"], r["sku_id"], r["advice"])
            for r in rows if r["sales_mom"] is not None and r["doi_days"] is not None]
     if pts:
@@ -124,7 +128,7 @@ def _make_scatter_chart(rows: list[dict], doi_threshold: int) -> dict:
                     "size": 10},
             name="SKU",
         ))
-    # 阈值参考线：DOI=阈值（呆滞分界）；环比=0
+    # threshold reference lines: DOI=threshold (dead-stock boundary); MoM=0
     fig.add_vline(x=doi_threshold, line_dash="dash", line_color="orange")
     fig.add_vline(x=URGENT_DAYS, line_dash="dash", line_color="red")
     fig.add_hline(y=0, line_dash="dot", line_color="gray")
@@ -138,10 +142,10 @@ def _make_scatter_chart(rows: list[dict], doi_threshold: int) -> dict:
 
 
 def inventory_diagnostic_tool(executor, args: dict) -> ToolResult:
-    """库存诊断工具实现（纯函数，不感知 LangGraph）。
+    """Inventory diagnostic tool (pure function, no LangGraph dependency).
 
-    executor：agent.executor.Executor（DuckDB 只读连接）。
-    args：JSON Schema 校验后的入参。
+    executor: agent.executor.Executor (DuckDB read-only connection).
+    args: JSON-Schema-validated args.
     """
     args = validate_args(INVENTORY_ARGS_SCHEMA, args or {})
     con = executor._con
@@ -151,7 +155,7 @@ def inventory_diagnostic_tool(executor, args: dict) -> ToolResult:
             "SELECT max(snapshot_date::DATE) FROM ods.inventory_snapshot").fetchone()[0])
     snap = _recent_snapshot_date(con, as_of)
 
-    # 基础快照（可选 sku/category 过滤）
+    # base snapshot (optional sku/category filter)
     where = ["snapshot_date::DATE = CAST(? AS DATE)"]
     params: list[str] = [snap]
     if args.get("sku_id"):
@@ -175,7 +179,7 @@ def inventory_diagnostic_tool(executor, args: dict) -> ToolResult:
     cat = _category_of(con, sku_ids)
     doi_threshold = args.get("doi_threshold") or DOI_THRESHOLD_DEFAULT
 
-    # 环比：本期近30天销量 vs 上期（前30天）销量
+    # MoM: last-30-day outbound vs prior-30-day outbound
     cur_start = f"DATE '{snap}' - INTERVAL {SELLOUT_DAYS} DAY"
     prev_start = f"DATE '{snap}' - INTERVAL {2 * SELLOUT_DAYS} DAY"
     cur_sales = _period_sales(con, sku_ids, snap, cur_start)
@@ -190,7 +194,7 @@ def inventory_diagnostic_tool(executor, args: dict) -> ToolResult:
         if prev_v > 0:
             mom = (cur_v - prev_v) / prev_v
         else:
-            mom = None  # 上期无销量，环比无意义
+            mom = None  # no prior-period sales → MoM meaningless
         advice = _advice(days, mom, doi_threshold)
         records.append({
             "sku_id": sid,
@@ -205,7 +209,7 @@ def inventory_diagnostic_tool(executor, args: dict) -> ToolResult:
     if args.get("top_n"):
         records = records[: args["top_n"]]
 
-    # insights：逐 SKU 结论（前 top_n）+ 汇总
+    # insights: per-SKU advice (top top_n) + summary
     insights = []
     for r in records:
         mom_txt = (f"，环比 {r['sales_mom']*100:+.0f}%" if r["sales_mom"] is not None else "")

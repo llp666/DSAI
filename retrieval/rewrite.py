@@ -1,7 +1,8 @@
-"""retrieval/rewrite.py：问题改写（相对时间 → 具体日期，规则优先，LLM 兜底接口预留）。
+"""retrieval/rewrite.py：question rewrite (relative time → concrete date, rules first).
 
-规则用 dateutil.relativedelta + 正则把「上个月/今年Q1/最近30天」等绝对化，
-使检索与语义查询都拿到可对齐的时间表达。改不动时返回原文（LLM 兜底在 pipeline 层接入）。
+Rules use dateutil.relativedelta + regex to absolutize 上个月/今年Q1/最近30天 etc., so retrieval and
+semantic query get a consistently time-aligned expression. Returns the input when nothing matches
+(an LLM fallback is plumbed at the pipeline layer).
 """
 
 from __future__ import annotations
@@ -24,9 +25,9 @@ def _day_str(d: date) -> str:
 
 
 def rewrite(question: str, ref_date: date) -> str:
-    """把问题中的相对时间绝对化；无相对时间则原样返回。"""
+    """Absolutize relative times; return unchanged when there is no relative time."""
     out = question
-    # 昨天 / 今天 / 前天 → 具体日期（day 窗口）
+    # 昨天 / 今天 / 前天 → concrete date (day window)
     m = re.search(r"昨天|今天|前天", out)
     if m:
         token = m.group(0)
@@ -65,7 +66,7 @@ def rewrite(question: str, ref_date: date) -> str:
         year = ref_date.year - (1 if m.group(1) == "去年" else 0)
         out = out.replace(m.group(1), f"{year}年")
         return out
-    # 季度：2026Q1 / 1季度2026年
+    # quarter: 2026Q1 / 1季度2026年
     m = _QUARTER.search(out)
     if m:
         if m.group(1):

@@ -17,19 +17,19 @@
 | L5 工具与呈现 | `tools/` | 库存/营销诊断工具、答案模板；`app.py` 是 Streamlit 前端入口 |
 
 ```
-├── data/            # L1 数据与元数据层
-├── retrieval/       # L2 检索层
-├── orchestration/   # L3 编排层
-├── compile/         # L4 语义编译与执行层
-├── tools/           # L5 工具与呈现层（含 templates/answer.j2）
-├── app.py           # L5 呈现：Streamlit 单页
-├── config.py        # 环境配置（.env）
-├── tracing.py       # 可观测适配（Langfuse / Noop 降级）
-├── datagen/         # 数仓数据生成器（构建期，独立）
-├── eval/            # 评测集与评测脚本
-├── tests/           # 单元测试
-├── warehouse/ meta/ # L1 生成产物（.gitignore）
-└── docs/            # 方案 + 架构说明 + 规格
+├── data/
+├── retrieval/
+├── orchestration/
+├── compile/
+├── tools/
+├── app.py
+├── config.py
+├── tracing.py
+├── datagen/
+├── eval/
+├── tests/
+├── warehouse/ meta/
+└── docs/
 ```
 
 ## 运行

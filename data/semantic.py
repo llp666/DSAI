@@ -1,8 +1,8 @@
-"""data/semantic.py：语义层五区块加载 + jsonschema 校验 + 关系图 BFS。
+"""data/semantic.py：load + validate 5-block semantic-layer YAML, build entity graph for BFS joins.
 
-- 加载 entities/relationships/metrics/dimensions/context 五个 YAML；
-- 用 jsonschema 做结构校验（fail-fast，进 CI 门禁）；
-- 构建实体关系无向图，提供确定性 BFS 求最短 JOIN 路径（编译器依赖）。
+- loads entities / relationships / metrics / dimensions / context YAML
+- jsonschema validation (fail-fast, CI gate)
+- builds an undirected entity-relationship graph for deterministic BFS shortest JOIN paths
 """
 
 from __future__ import annotations
@@ -47,13 +47,22 @@ class SemanticLayer:
     def dimension_names(self) -> list[str]:
         return list(self.dimensions)
 
+    def format_dimensions(self, with_location: bool = False) -> str:
+        """Render the dimension list as prompt text; ``with_location`` appends table.column."""
+        lines = []
+        for name, d in self.dimensions.items():
+            vals = " / ".join(str(v) for v in d["values"])
+            loc = f"，表 {d['table']}.{d['column']}" if with_location else ""
+            lines.append(f"- {name}（{d['display_name']}{loc}）：可选值 {vals}")
+        return "\n".join(lines)
+
 
 def _build_graph(entities: dict, relationships: dict) -> dict:
     graph = {e: [] for e in entities}
     for name, rel in relationships.items():
         graph[rel["left"]].append((rel["right"], name))
         graph[rel["right"]].append((rel["left"], name))
-    # 每个邻接列表按邻接实体名排序 → BFS 遍历顺序确定
+    # sort each adjacency list by neighbor name → deterministic BFS traversal order
     for e in graph:
         graph[e].sort(key=lambda x: x[0])
     return graph
@@ -66,7 +75,7 @@ def load_semantic_layer(dir_path: Path, schema_path: Path) -> SemanticLayer:
         if not p.exists():
             raise SemanticLayerError(f"语义层文件缺失：{fname}")
         loaded = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        # 兼容「文件顶层带区块名」与「文件顶层即区块内容」两种写法
+        # tolerate both "top-level key == block name" and "top-level is the block itself"
         if isinstance(loaded, dict) and block in loaded:
             loaded = loaded[block]
         data[block] = loaded
@@ -85,10 +94,10 @@ def load_semantic_layer(dir_path: Path, schema_path: Path) -> SemanticLayer:
 
 
 def bfs_path(graph: dict, start: str, target: str) -> list[tuple[str, str, str]]:
-    """返回 start→target 的 BFS 最短路径：[(from实体, to实体, 关系名), ...]。"""
+    """Shortest BFS path start→target: [(from_entity, to_entity, relationship_name), ...]."""
     if start == target:
         return []
-    prev: dict[str, tuple[str, str]] = {}  # 实体 -> (前驱实体, 关系名)
+    prev: dict[str, tuple[str, str]] = {}  # entity -> (predecessor, relationship_name)
     visited = {start}
     queue = deque([start])
     while queue:
@@ -112,10 +121,10 @@ def bfs_path(graph: dict, start: str, target: str) -> list[tuple[str, str, str]]
 
 
 def build_join_chain(graph: dict, start: str, targets: set[str]) -> list[tuple[str, str]]:
-    """从 start 出发覆盖所有 targets 的确定性 JOIN 链。
+    """Deterministic JOIN chain covering all targets from start.
 
-    返回 [(实体, 关系名), ...]：链上每个实体与其前驱按该关系名的 ON 条件 JOIN。
-    targets 按名称排序 → 路径选择确定，同一查询永远编译出同一 SQL。
+    Returns [(entity, relationship_name), ...]; each entity joins its predecessor on the
+    relationship's ON condition. Targets iterate in name order → deterministic SQL.
     """
     if not targets:
         return []

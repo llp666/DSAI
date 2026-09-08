@@ -1,38 +1,28 @@
-"""app.py：Streamlit 单页 Demo（阶段 3-4F）。
+"""app.py：ChatGPT-style chat interface.
 
-用法：streamlit run app.py
-- 输入自然语言问题 → 展示 Agent 答案 + 阶段/工具/预算元信息
-- 工具轨（inventory_diagnostic）额外渲染 Plotly 图（DOI×环比散点象限图）
+- sidebar: new-chat button + past-conversation list (conversation history)
+- main: chat bubbles + bottom input; business questions go to the state machine,
+  casual talk goes to a plain LLM conversation (see orchestration/dialogue.route_dialogue)
 """
 
 from __future__ import annotations
 
+import uuid
+
 import streamlit as st
 
-st.set_page_config(page_title="DSAI 电商数据分析 Agent", page_icon="📊", layout="wide")
+st.set_page_config(page_title="电商智能问数 Agent", page_icon="📊", layout="wide")
 
 
 @st.cache_resource
 def get_pipeline():
     from orchestration.pipeline import Pipeline
+
     return Pipeline()
 
 
-def render_meta(result: dict) -> None:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("stage", result.get("stage") or "-")
-    c2.metric("工具", result.get("tool_used") or "-")
-    c3.metric("LLM 调用", result.get("budget", {}).get("calls", 0))
-    c4.metric("Token", result.get("budget", {}).get("tokens", 0))
-    c5.metric("耗时 s", result.get("budget", {}).get("elapsed_s", 0))
-    if result.get("preflight_kind") and result.get("preflight_kind") != "pass":
-        st.caption(f"预检：{result.get('preflight_kind')} — {result.get('preflight_reason', '')[:80]}")
-    if result.get("error_categories"):
-        st.caption(f"错误分类：{', '.join(result.get('error_categories'))}")
-
-
 def render_chart(result: dict) -> None:
-    """工具轨结果含 _tool_chart（Plotly figure JSON）时渲染散点象限图。"""
+    """Render the inventory scatter-quadrant chart when the result carries a _tool_chart."""
     chart = result.get("_tool_chart")
     if not chart:
         return
@@ -45,33 +35,80 @@ def render_chart(result: dict) -> None:
         st.caption(f"（图表渲染失败：{e}）")
 
 
+def _conversation_history(messages: list[dict]) -> list[dict]:
+    """Pair consecutive user→assistant turns into the agent's history [{question, answer}]."""
+    history = []
+    pending = None
+    for m in messages:
+        if m["role"] == "user":
+            pending = m["content"]
+        elif m["role"] == "assistant" and pending is not None:
+            history.append({"question": pending, "answer": m["content"]})
+            pending = None
+    return history
+
+
 def main() -> None:
-    st.title("DSAI 电商数据分析 Agent")
-    st.caption("语义查询 DSL + 诊断工具（库存/营销漏斗）· LangGraph 状态机 · 三层熔断")
-    question = st.text_input("问题", value="SKU-14167349 还够卖几天？",
-                             placeholder="例如：哪些SKU断货？上个月GMV是多少？")
-    use_alt = st.checkbox("备选 LLM 供应商", value=False)
-    if st.button("运行", type="primary"):
-        with st.spinner("Agent 处理中…"):
-            p = get_pipeline()
-            result = p.answer(question, use_alt=use_alt)
-        st.markdown("---")
-        render_meta(result)
-        if result.get("tool_answer"):
-            st.markdown("### 诊断工具洞察")
-            st.markdown(result["answer"])
-            render_chart(result)  # 工具 chart 已由工具轮提取进 state（_tool_chart）
-        else:
-            st.markdown("### 答案")
-            st.markdown(result.get("answer", ""))
-        with st.expander("诊断信息"):
-            st.json({k: result.get(k) for k in
-                     ["intent", "stage", "tool_used", "retrieved_tables",
-                      "preflight_kind", "error_categories", "budget",
-                      "compiled_sql", "trace_id"]})
-    st.markdown("---")
-    st.caption("示例问题：哪些SKU断货？| 上个月GMV是多少？| 各品类净销售额？"
-               "| 搜索广告渠道的ROI是多少？| SKU-14167349 还够卖几天？")
+    if "conversations" not in st.session_state:
+        st.session_state.conversations = {}
+    if "current" not in st.session_state:
+        st.session_state.current = None
+
+    p = get_pipeline()
+
+    # ---- sidebar: new chat + conversation history ----
+    with st.sidebar:
+        st.markdown("## 电商智能问数 Agent")
+        if st.button("＋ 新建对话", use_container_width=True):
+            st.session_state.current = None
+            st.rerun()
+        st.divider()
+        for conv_id in reversed(list(st.session_state.conversations.keys())):
+            conv = st.session_state.conversations[conv_id]
+            if st.button(conv["title"][:24], key=conv_id, use_container_width=True):
+                st.session_state.current = conv_id
+                st.rerun()
+
+    # ---- main chat area ----
+    conv = st.session_state.conversations.get(st.session_state.current)
+    messages = conv["messages"] if conv else []
+
+    for m in messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m["role"] == "assistant" and m.get("result"):
+                render_chart(m["result"])
+
+    if question := st.chat_input("问我一件事，例如：2026年7月GMV是多少？"):
+        if st.session_state.current is None or st.session_state.current not in st.session_state.conversations:
+            conv_id = uuid.uuid4().hex[:12]
+            st.session_state.conversations[conv_id] = {
+                "title": question[:20],
+                "thread_id": uuid.uuid4().hex[:12],
+                "messages": [],
+            }
+            st.session_state.current = conv_id
+        conv = st.session_state.conversations[st.session_state.current]
+        history = _conversation_history(conv["messages"])
+
+        conv["messages"].append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            result = {}
+            try:
+                with st.spinner("Agent 处理中…"):
+                    result, chunks = p.chat_stream(
+                        question, history=history, thread_id=conv["thread_id"])
+                full = st.write_stream(chunks)
+            except Exception as e:
+                full = f"（出错了：{e}）"
+                st.markdown(full)
+                result = {}
+            render_chart(result)
+            conv["messages"].append(
+                {"role": "assistant", "content": full, "result": result})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-"""data/tables.py：真实数据表白名单（has_data 判定依据）。
+"""data/tables.py：real-data table whitelist (has_data).
 
-真实表 = 有数据的表（datagen 生成，31 张）；catalog 表 = 目录级空表（0 行）。
-检索层据此给语料打 has_data 元数据标签，替代硬编码后缀/白名单散落判断。
+Real tables = tables with data (datagen-generated, 31); catalog tables = directory-level empty tables (0 rows).
+The retrieval layer tags corpus entries with has_data from here, replacing scattered suffix/whitelist checks.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
-"""data/corpus.py：检索语料构建（table_docs + 场景卡 → 校验 → 向量化文本）。
+"""data/corpus.py：build the retrieval corpus (table_docs + scenario cards → validate → embeddable text).
 
-- 加载 meta/table_docs.json 与 semantic_layer/scenarios.yaml；
-- 渲染为可向量化 document（含表名/描述/字段/示例问题）；
-- jsonschema 校验，不通过即拒收并抛错（进 CI 门禁）。
+- loads meta/table_docs.json and data/semantic_layer/scenarios.yaml;
+- renders an embeddable document (table name / description / fields / sample questions);
+- jsonschema-validates; rejects on failure (CI gate).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _render_scenario(sc: dict) -> str:
 
 def build_corpus(meta_dir: Path, scenarios_path: Path,
                  schema_path: Path, updated_at: str) -> list[dict]:
-    """构建入库语料条目列表（已通过 jsonschema 校验）。"""
+    """Build the validated corpus entries."""
     table_docs = json.loads(
         (resolve(meta_dir) / "table_docs.json").read_text(encoding="utf-8"))
     scenarios = yaml.safe_load(
@@ -68,14 +68,14 @@ def build_corpus(meta_dir: Path, scenarios_path: Path,
         entries.append(entry)
     for sc in scenarios:
         entry = {
-            "id": sc["id"],  # 已是 scn_ 前缀
+            "id": sc["id"],  # already scn_-prefixed
             "doc_type": "scenario",
             "domain": sc.get("domain", ""),
             "document": _render_scenario(sc),
             "metadata": {
                 "updated_at": updated_at,
                 "tables": sc.get("involved_tables", []),
-                "has_data": True,  # 场景卡涉及真实表
+                "has_data": True,  # scenario cards involve real tables
             },
         }
         entries.append(entry)

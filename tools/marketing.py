@@ -1,13 +1,12 @@
-"""tools/marketing.py：营销 ROI 漏斗工具骨架（阶段 3-4D）。
+"""tools/marketing.py：marketing ROI funnel tool skeleton (stage 3-4D).
 
-契约三件套完整（入参 JSON Schema + ToolResult 出参 + ToolError），但漏斗拆解
-（曝光→点击→加购→支付各环节转化）内部逻辑尚未实现，调用即抛结构化
-ToolError(not_implemented)，经 ToolNode handle_tool_errors=True 包装为
-ToolMessage 回灌统一纠错轨，由 error_classifier 分类后走 repair/reflect，
-提示用户改用支持的口径（marketing_roi 指标）。
+Full contract triple (args JSON Schema + ToolResult + ToolError), but the funnel breakdown
+(曝光→点击→加购→支付 conversion per stage) is not implemented yet: any call raises
+ToolError(not_implemented), wrapped by ToolNode handle_tool_errors=True → ToolMessage → shared
+repair track, telling the user to use the supported caliber (marketing_roi metric).
 
-与 tools_inventory.py 同为「契约驱动工具」：只依赖 Executor（DuckDB 只读），
-不感知 LangGraph。后续阶段补漏斗拆解逻辑时，保持本文件契约不变，仅填充实现。
+Same "contract-driven tool" as tools/inventory.py: depends only on Executor (DuckDB read-only),
+not LangGraph. Later stages fill in the funnel logic without touching the contract.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from tools.contract import (
     validate_args,
 )
 
-# 入参 JSON Schema（LLM 调用时 jsonschema 校验）
+# args JSON Schema (jsonschema-validated on LLM calls)
 MARKETING_ARGS_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -33,12 +32,9 @@ MARKETING_ARGS_SCHEMA: dict = {
 
 
 def marketing_roi_funnel_tool(executor, args: dict) -> ToolResult:
-    """营销 ROI 漏斗工具骨架。
+    """Marketing ROI funnel tool skeleton.
 
-    当前版本：契约与入参校验完整，但漏斗拆解逻辑未实现。
-    调用即抛 ToolError(not_implemented)，结构化错误回灌纠错轨——
-    由 LLM 收到「未实现，请改用 marketing_roi 指标」的修复提示后，
-    走语义查询链路用 SUPPORTED_METRICS 里的 marketing 指标回答。
+    Current version: contract + arg validation complete, but the funnel breakdown is unimplemented.
     """
     validate_args(MARKETING_ARGS_SCHEMA, args or {})
     raise ToolError(

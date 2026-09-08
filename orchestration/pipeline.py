@@ -1,8 +1,8 @@
-"""orchestration/pipeline.py：阶段一最小链路编排。
+"""orchestration/pipeline.py：minimal chain orchestration.
 
-问题 → 检索(硬编码 Top-3) → LLM 生成语义查询(pydantic 校验, 失败重试 1 次)
-     → 编译 SQL → DuckDB 只读执行 → 口径披露回答
-全流程 Langfuse 埋点（retrieve / generate / compile / execute 四 span）。
+question → retrieve (hardcoded Top-3) → LLM generates a semantic query (pydantic-validated, 1 retry)
+        → compile SQL → DuckDB read-only execute → caliber-disclosing answer
+Full flow traced via Langfuse (retrieve / generate / compile / execute spans).
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ from compile.executor import Executor
 from orchestration.graph import DsaiGraph
 from orchestration.llm import LLMClient, build_llm
 from orchestration.monitor import MonitoredLLM, QuestionMonitor
-from orchestration.prompts import build_system_prompt
+from orchestration.dialogue import route_dialogue
+from orchestration.prompts import build_system_prompt, render_history
 from retrieval.prompt_budget import render_tables_budgeted
 from orchestration.repair import try_repair
 from retrieval.retriever import Retriever
@@ -33,7 +34,7 @@ from compile.types import AgentState, SemanticQuery
 from retrieval.vector_store import VectorStore
 
 
-# 检索注入 Token 预算（agnes maxInput 128k 的 1/8，预留指令/回答余量）
+# retrieval injection token budget (1/8 of agnes 128k maxInput, leaving room for instruction/answer)
 RETRIEVAL_BUDGET = 16000
 
 
@@ -65,7 +66,7 @@ class Pipeline:
         )
         self._answer_tpl = self._env.get_template("answer.j2")
         self._graph = None
-        self._monitor: QuestionMonitor | None = None  # 当前问题预算监控（answer 入口建）
+        self._monitor: QuestionMonitor | None = None  # per-question budget (set at answer entry)
 
     def _get_llm(self, use_alt: bool) -> LLMClient:
         if use_alt:
@@ -75,29 +76,29 @@ class Pipeline:
             llm = self._llm
         else:
             llm = self._llm
-        # 熔断包装：当前问题有监控时，每次调用计入预算（超限抛 BudgetExceeded）
+        # budget wrapper: when a monitor is active, each call counts (overrun raises BudgetExceeded)
         if self._monitor is not None:
             return MonitoredLLM(llm, self._monitor)
         return llm
 
     def begin_question(self, **limits) -> QuestionMonitor:
-        """开启单问预算监控（answer 入口调用）；重复调用则复用当前。"""
+        """Open the per-question budget monitor (answer entry); reuses the current one on repeat."""
         if self._monitor is None:
             self._monitor = QuestionMonitor(**limits)
         return self._monitor
 
     def end_question(self) -> dict | None:
-        """结束单问监控，返回预算快照并清理。"""
+        """Close the per-question monitor, return the budget snapshot, and reset."""
         if self._monitor is None:
             return None
         snap = self._monitor.snapshot()
         self._monitor = None
         return snap
 
-    # ---------- 语义查询生成（含 pydantic 校验 + 重试 1 次） ----------
+    # ---------- semantic query generation (pydantic validation + 1 retry) ----------
     def _parse_semantic_query(self, raw: str) -> SemanticQuery:
         text = raw.strip()
-        # 去掉可能的 markdown 代码围栏 ```json ... ```
+        # strip possible markdown code fences ```json ... ```
         m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
         if m:
             text = m.group(1)
@@ -107,7 +108,7 @@ class Pipeline:
                   today: str) -> tuple[SemanticQuery | None, str | None, int]:
         system = build_system_prompt(self.layer, schema_text, today)
         last_error: str | None = None
-        for attempt in range(2):  # 首次 + 重试 1 次
+        for attempt in range(2):  # first try + 1 retry
             user = question if attempt == 0 else (
                 f"{question}\n\n注意：你上一次输出的语义查询 JSON 解析失败：{last_error}\n"
                 "请只输出符合格式要求的合法 JSON。"
@@ -117,11 +118,11 @@ class Pipeline:
                 return self._parse_semantic_query(raw), raw, attempt
             except (ValidationError, json.JSONDecodeError) as e:
                 last_error = str(e)
-            except Exception as e:  # LLMError 等：不重试，直接上抛
+            except Exception:  # LLMError etc.: no retry, re-raise
                 raise
         return None, last_error, 1
 
-    # ---------- 回答组装（口径披露） ----------
+    # ---------- answer assembly (caliber disclosure) ----------
     _RATE_METRICS = {"repurchase_rate", "refund_rate", "gross_margin"}
     _INT_METRICS = {"orders_count"}
 
@@ -135,7 +136,7 @@ class Pipeline:
         return f"{float(value):,.2f}"
 
     def _dim_suffix(self, sq: SemanticQuery) -> str:
-        """从维度过滤生成可读后缀，如「服饰品类」「一线城市」。"""
+        """Build a readable suffix from dimension filters, e.g. 「服饰品类」「一线城市」."""
         display = {n: d["display_name"] for n, d in self.layer.dimensions.items()}
         parts = []
         for f in sq.filters:
@@ -150,7 +151,7 @@ class Pipeline:
         suffix = self._dim_suffix(sq)
         if value is None:
             return f"【{meta['display_name']}】{ym}" + (f" · {suffix}" if suffix else "") + " 无数据"
-        # 多行分组结果（各品类GMV等）：逐行渲染「维度值: 指标值」
+        # multi-row grouped result (per-category GMV etc.): one line per row "dim value: metric value"
         if isinstance(value, list):
             lines = [f"【{meta['display_name']}】{ym}"
                      + (f" · {suffix}" if suffix else "")]
@@ -170,11 +171,55 @@ class Pipeline:
             sql=sql,
         )
 
-    # ---------- 主入口（阶段三：委托 LangGraph 状态机） ----------
-    def answer(self, question: str, *, use_alt: bool = False) -> dict:
+    # ---------- main entry (stage 3: delegate to the LangGraph state machine) ----------
+    def answer(self, question: str, *, use_alt: bool = False,
+               thread_id: str | None = None, history: list[dict] | None = None) -> dict:
         if self._graph is None:
             self._graph = DsaiGraph(self)
-        return self._graph.answer(question, use_alt=use_alt)
+        return self._graph.answer(question, use_alt=use_alt,
+                                  thread_id=thread_id, history=history)
+
+    def answer_stream(self, question: str, *, use_alt: bool = False,
+                      thread_id: str | None = None,
+                      history: list[dict] | None = None):
+        """Run the pipeline and return (result, chunks): ``chunks`` streams the answer text.
+
+        The deterministic pipeline runs to completion first; the final answer is then rewritten +
+        streamed by the LLM from the grounded result. Tool-insight, degrade and empty answers are
+        echoed verbatim (no second LLM call).
+        """
+        result = self.answer(question, use_alt=use_alt, thread_id=thread_id, history=history)
+        return result, self._answer_chunks(result)
+
+    def chat_stream(self, question: str, *, thread_id: str | None = None,
+                    history: list[dict] | None = None):
+        """Chat entry: route business questions to the state machine, casual talk to plain LLM chat.
+
+        Returns (result, chunks): ``result`` is the deterministic state-machine result for business
+        questions (or {} for casual), ``chunks`` streams the answer text.
+        """
+        if route_dialogue(question) == "business":
+            return self.answer_stream(question, thread_id=thread_id, history=history)
+        return {}, self._casual_chunks(question, history)
+
+    def _casual_chunks(self, question: str, history: list[dict] | None = None):
+        """Stream a plain conversational reply (no semantic query / SQL)."""
+        system = (
+            "你是「电商智能问数 Agent」，一个面向电商业务数据的智能问答助手，"
+            "能帮用户查询 GMV、销售额、订单、库存等经营指标。\n"
+            "对话规则：\n"
+            "- 始终以「电商智能问数 Agent」自称，绝不透露底层模型名称或厂商身份（如 agnes、OpenAI 等）。\n"
+            "- 友好、简洁地回答问候、闲聊、自我介绍、功能帮助类问题。\n"
+            "- 若用户提到数据或指标但表述不明确，引导其说清要查询的指标与时间范围。\n"
+            "- 不编造任何数据或数字；涉及具体数值的问题交由数据查询链路回答。"
+        )
+        hist = render_history(history)
+        user = question if not hist else f"对话历史：\n{hist}\n\n当前问题：{question}"
+        yield from self._get_llm(False).stream_complete(system, user)
+
+    def _answer_chunks(self, result: dict):
+        """Yield the deterministic answer verbatim (tool insight / normal / degrade all ship)."""
+        yield result.get("answer", "")
 
 
 def run_one(question: str, *, cfg: Config | None = None, use_alt: bool = False) -> dict:

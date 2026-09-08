@@ -1,11 +1,11 @@
-"""compile/compiler.py：确定性编译器 v2（纯函数）。
+"""compile/compiler.py：deterministic compiler v2 (pure functions).
 
-把语义查询 SemanticQuery 展开为精确 SQL：
-- 11 指标由语义层 metrics 的 parts/combine 结构驱动；
-- 维度下钻经关系图 BFS 自动补全 JOIN 路径；
-- 命中 item_grain 维度时订单级口径自动切明细级（避免 1:N 扇出重复求和）；
-- 组合指标 parts 值经 COALESCE(...,0) 保证空部分不污染算术；
-- 产出 SQL 用 sqlglot 做 parse 校验（方言适配 + 语法门禁）。
+Expands a SemanticQuery into exact SQL:
+- metrics driven by the semantic-layer parts/combine structure;
+- dimension drill-downs join via entity-graph BFS shortest paths;
+- item_grain dimensions switch order-level calibers to item-level (avoid 1:N fan-out double count);
+- combine parts are COALESCE(...,0)-wrapped so empty parts don't corrupt arithmetic;
+- output SQL is gated by a sqlglot parse (dialect + syntax gate).
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import calendar
 import re
 from datetime import date, timedelta
-from pathlib import Path
 
 import sqlglot
 
@@ -94,7 +93,7 @@ def _dim_cond(dim_def: dict, f: DimensionFilter) -> str:
 
 
 def _validate_sql(sql: str) -> None:
-    """sqlglot parse 门禁：语法非法即编译失败。"""
+    """sqlglot parse gate: syntax-invalid SQL fails compilation."""
     try:
         sqlglot.parse_one(sql, read="duckdb")
     except Exception as e:
@@ -102,7 +101,7 @@ def _validate_sql(sql: str) -> None:
 
 
 def _qualify_combine(combine: str, part_names: list[str]) -> str:
-    """把 combine 公式中的 part 名替换为 COALESCE(CTE 列, 0)，保证空部分不污染算术。"""
+    """Replace part names in the combine formula with COALESCE(CTE col, 0) to avoid empty-part pollution."""
     out = combine
     for name in sorted(part_names, key=len, reverse=True):
         out = re.sub(rf"\b{re.escape(name)}\b", f"COALESCE(p_{name}.{name}, 0)", out)
@@ -168,17 +167,16 @@ def _compile_parts(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
     qualified = _qualify_combine(meta["combine"], part_names)
     rd = meta.get("round_digits", 2)
     froms = ", ".join(f"p_{n}" for n in part_names)
-    sql = (
+    return (
         f"WITH {', '.join(ctes)}\n"
         f"SELECT COALESCE(round(({qualified})::DOUBLE, {rd}), 0) AS result\n"
         f"FROM {froms}"
     )
-    return sql
 
 
 def _compile_window(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                     dims: list[tuple[str, dict]]) -> str:
-    # 窗口指标（复购率等）的 90 天滚动窗口锚定月末，日窗口无意义 → 守卫拒绝
+    # window metrics (repurchase rate etc.) anchor a 90-day rolling window to month-end; day windows are refused
     if sq.window.type != "month":
         raise CompileError(f"窗口指标 {sq.metric} 仅支持月窗口，不支持 {sq.window.type} 窗口")
     w_start, w_end = _window_bounds(sq.window.value)
@@ -216,7 +214,7 @@ def _compile_rank(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
     qualified = _qualify_combine(meta["combine"], part_names)
     order = meta["rank"]["order"]
     limit = meta["rank"]["limit"]
-    # 按 group_key 对齐各分组 part（LEFT JOIN 保证无退款/无销量的 sku 不丢）
+    # align group parts on group_key (LEFT JOIN keeps no-refund/no-sales SKUs)
     joins = f"p_{part_names[0]}"
     for n in part_names[1:]:
         joins += f" LEFT JOIN p_{n} ON p_{part_names[0]}.{gk} = p_{n}.{gk}"
@@ -231,14 +229,14 @@ LIMIT {limit}
 
 def _compile_snapshot(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                       dims: list[tuple[str, dict]]) -> str:
-    """kind=snapshot 指标：按快照时点做点查（如期末断货 SKU 数）。
+    """kind=snapshot metric: point-in-time lookup (e.g. stockout SKU count at period end).
 
-    meta 需带 snapshot 配置：
-      entity:  快照实体名（如 inventory_snapshot）
-      when:    value 取值（'end'=取窗口末日的快照 / 'latest'=取窗口内最新快照）
-      cond:    WHERE 条件（引用实体别名，如 "inventory_snapshot.on_hand_qty = 0"）
-      count_col / count_distinct: 计数方式（默认 count(*)）
-    只支持日窗口或单月（快照按日期点查）。
+    meta must carry a snapshot config:
+      entity:       snapshot entity name (e.g. inventory_snapshot)
+      when:         value ('end'=last snapshot of window / 'latest'=latest snapshot in window)
+      cond:         WHERE condition (refers to entity alias, e.g. "inventory_snapshot.on_hand_qty = 0")
+      count_col / count_distinct: count mode (default count(*))
+    Supports day windows or a single month (snapshot is point-in-time).
     """
     snap = meta.get("snapshot", {})
     entity = snap.get("entity")
@@ -248,7 +246,7 @@ def _compile_snapshot(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
     if not cond:
         raise CompileError(f"快照指标 {sq.metric} 缺少 snapshot.cond 配置")
 
-    # 维度可达性：快照实体必须能 JOIN 到维度表（如按品类统计断货）
+    # dimension reachability: snapshot entity must join to the dimension tables
     dim_tables = {d["table"] for _, d in dims}
     try:
         chain = build_join_chain(layer.graph, entity, dim_tables)
@@ -256,15 +254,15 @@ def _compile_snapshot(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
         raise CompileError(f"快照指标 {sq.metric} 不支持维度：{e}")
     from_clause = _build_from(layer, entity, chain)
 
-    # 时点解析：日窗口取当日快照；月窗口取窗口内末日最近快照
+    # time-point resolution: day = that day's snapshot; month = latest snapshot <= window end
     start, end = _bounds_for(sq.window.type, sq.window.value)
     snap_table = layer.resolve_table(entity)
     if sq.window.type == "day":
         date_cond = f"({entity}.snapshot_date = DATE '{start}')"
-        # 快照存在性：该日无快照 → HAVING 过滤聚合组 → 空结果（触发 reflect_empty）
+        # snapshot existence: no snapshot that day → HAVING filters group → empty (triggers reflect_empty)
         exist_cond = f"(SELECT count(*) FROM {snap_table} WHERE snapshot_date = DATE '{start}')"
     else:
-        # 月窗口：取 <= 窗口末日的最近一个快照日（快照周粒度，避免多快照重复计数）
+        # month: latest snapshot day <= window end (weekly snapshots; avoids multi-snapshot double count)
         date_cond = (f"({entity}.snapshot_date = ("
                      f"SELECT max(snapshot_date) FROM {snap_table} "
                      f"WHERE snapshot_date::DATE <= DATE '{end}'))")
@@ -276,7 +274,7 @@ def _compile_snapshot(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
 
     inner = f"count(DISTINCT {entity}.{snap.get('count_col', 'sku_id')})"
     rd = meta.get("round_digits", 0)
-    # HAVING 快照存在性：无快照（时点无数据）→ 聚合组被过滤 → 返回空结果（诚实，不静默 0）
+    # HAVING snapshot-existence: no snapshot → filtered → empty result (honest, no silent 0)
     return f"""
 SELECT COALESCE(round({inner}::DOUBLE, {rd}), 0) AS result
 FROM {from_clause}
@@ -292,7 +290,7 @@ def _compile_query(sq: SemanticQuery, layer: SemanticLayer) -> str:
     dims = _resolve_dims(layer, sq)
     fan_out = any(d["item_grain"] for _, d in dims)
 
-    # 维度可达性预检：每个 part 必须能到达所有维度表，否则该组合非法
+    # dimension reachability precheck: every part must reach all dimension tables, else illegal combo
     for name, part in meta.get("parts", {}).items():
         base = _part_base(layer, part, fan_out)
         dim_tables = {d["table"] for _, d in dims}

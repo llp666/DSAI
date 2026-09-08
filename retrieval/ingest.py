@@ -1,7 +1,7 @@
-"""retrieval/ingest.py：检索语料构建 + 入库 CLI。
+"""retrieval/ingest.py：corpus build + ChromaDB ingest CLI.
 
-用法：python -m agent.ingest_corpus
-产出：warehouse/chroma/（ChromaDB persistent，含 domain/doc_type 标签）
+Usage: python -m retrieval.ingest
+Output: warehouse/chroma/ (ChromaDB persistent, tagged domain/doc_type)
 """
 
 from __future__ import annotations

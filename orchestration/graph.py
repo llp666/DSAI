@@ -1,15 +1,15 @@
-"""orchestration/graph.py：阶段三 LangGraph 状态机（九节点 + SQL 工具 + 纠错轨）。
+"""orchestration/graph.py：stage-3 LangGraph state machine (nine nodes + SQL tools + repair track).
 
-把阶段二 pipeline 的函数链迁为 StateGraph 状态机：
-- 主链：intent → retrieve → generate → tools → judge → answer
-- judge 三分类条件边（四优先级判定）：
-    成功 → answer（正常组装）
-    可修复 → repair（确定性规则）→ reflect（LLM 反思）→ generate（同轮重试，≤max_retries）
-    不可修复 → answer（降级回答）
-- tools 节点 = ToolNode([compile, dry_run, execute], handle_tool_errors=True)，
-  工具异常包装为 ToolMessage「Error: …」真实错误文本回灌给 repair/reflect/generate。
+Migrates stage-2's function chain into a StateGraph:
+- main chain: intent → retrieve → generate → tools → judge → answer
+- judge three-way conditional edges (four-priority decision):
+    success → answer (normal assembly)
+    repairable → repair (deterministic rules) → reflect (LLM reflection) → generate (same-round retry, ≤ max_retries)
+    unrepairable → answer (degraded)
+- tools node = ToolNode([compile, dry_run, execute], handle_tool_errors=True), tool exceptions wrapped
+  as ToolMessage「Error: …」and fed back to repair/reflect/generate.
 
-状态与组件通过 Pipeline 注入（graph.py 不 import pipeline.py，避免循环）。
+State and components are injected via Pipeline (graph.py doesn't import pipeline.py, avoiding a cycle).
 """
 
 from __future__ import annotations
@@ -35,22 +35,24 @@ from retrieval.prompt_budget import render_tables_budgeted
 from orchestration.prompts import build_system_prompt
 from orchestration.relevance import check_relevance
 from retrieval.rewrite import rewrite
+from retrieval.query_rewrite import rewrite_query
 from tools.contract import ToolError, serialize_result
 from orchestration.tool_router import route_tool_intent
 from tools.inventory import inventory_diagnostic_tool
 from tools.marketing import marketing_roi_funnel_tool
 from compile.types import AgentState, SemanticQuery
 
-# 检索注入 Token 预算（agnes maxInput 128k 的 1/8，预留指令/回答余量）
+# retrieval injection token budget (1/8 of agnes 128k maxInput, leaving room for instruction/answer)
 RETRIEVAL_BUDGET = 16000
 MAX_RETRIES = 2
-# 递归上限：主链 5 步 + 每轮 repair 5 步 × (MAX_RETRIES+1) + 余量。超限抛 GraphRecursionError，
-# 由 answer() 捕获降级而非静默截断（配合 checkpointer 在 Langfuse 看完整路径）
+# recursion limit: main chain 5 steps + per-round repair 5 steps × (MAX_RETRIES+1) + margin.
+# overrun raises GraphRecursionError, caught in answer() and degraded rather than silently truncated
+# (checkpointer keeps the full path visible in Langfuse)
 RECURSION_LIMIT = 5 * (MAX_RETRIES + 1) + 5
 
 
 class _NullCtx:
-    """未启用 trace 时的空上下文（与 Langfuse span 兼容）。"""
+    """Empty context manager when tracing is off (compatible with Langfuse spans)."""
 
     def __enter__(self):
         return self
@@ -61,7 +63,8 @@ class _NullCtx:
     def update(self, **kw):
         pass
 
-# 意图/域分类（关键词 → 域标签；顺序匹配，先命中先得）
+
+# intent/domain classification (keyword → domain label; first match wins)
 INTENT_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("营销域", ("roi", "渠道", "广告", "投放", "转化", "归因", "花费", "营销", "cpm", "ctr")),
     ("供应链域", ("库存", "断货", "呆滞", "补货", "在途", "供应商", "入库", "仓库", "动销", "采购")),
@@ -82,7 +85,7 @@ def _classify_intent(question: str) -> str:
 
 
 def _parse_result(res: str):
-    """解析 execute_tool 返回的 JSON 行数组：单行单列→标量，多行→list[list]。"""
+    """Parse execute_tool's JSON row array: single row/col → scalar, else list[list]."""
     try:
         rows = json.loads(res)
     except json.JSONDecodeError:
@@ -93,33 +96,30 @@ def _parse_result(res: str):
 
 
 def _is_empty(result) -> bool:
-    """空结果判定：None 或空列表（rank/snapshot 类指标无数据时返回 []）。"""
+    """Empty verdict: None or empty list (rank/snapshot metrics return [] with no data)."""
     return result is None or (isinstance(result, list) and len(result) == 0)
 
 
 def _looks_like_json(text: str) -> bool:
-    """粗判 LLM 输出是否像 JSON（语义查询对象）。"""
+    """Rough check whether LLM output looks like JSON (a semantic-query object)."""
     t = text.strip()
     return t.startswith("{") or t.startswith("```json") or t.startswith("```")
 
 
 def _jsonable_state(final: dict) -> dict:
-    """③ 序列化防御：剔除 state 中不消费且不可 JSON 化的消息对象。
+    """Serialization guard: drop state fields that are unconsumed and not JSON-serializable.
 
-    LangGraph 把 AIMessage/ToolMessage 对象累积进 state.messages，app/eval 均不消费；
-    一旦 telemetry/日志整体 json.dumps(state) 会因消息对象序列化失败。只剔除 messages。
-    semantic_query 是 pydantic 模型，虽非 JSON 标量但被 eval（run_eval/run_injection）
-    按模型消费（.model_dump()/.dimensions/.window.value），保留原样。
-    chart 已在上游固化为 JSON 字符串（_tool_chart），全链无 go.Figure 对象出圈。
+    LangGraph accumulates AIMessage/ToolMessage objects into state.messages, which app/eval don't
+    consume; a wholesale json.dumps(state) would fail on them. Drop messages only. semantic_query
+    is a pydantic model — not a JSON scalar, but eval (run_eval/run_injection) consumes it as a
+    model (.model_dump()/.dimensions/.window.value), so keep it as-is. The chart is already a JSON
+    string upstream (_tool_chart); no go.Figure ever leaves.
     """
     return {k: v for k, v in final.items() if k != "messages"}
 
 
 def _build_tool_user(question: str, tool_result: str | None) -> str:
-    """构造工具调用轮的 user 消息：首轮只给问题；后续把工具结果/错误一并给 LLM 收敛。
-
-    工具成功 → 基于结果给自然语言洞察；工具错误 → 提示改用语义查询 JSON 走指标链路。
-    """
+    """Build the tool-round user message: first round is the question; later rounds append the result/error."""
     if not tool_result:
         return question
     if tool_result.startswith("工具调用失败"):
@@ -134,10 +134,10 @@ def _build_tool_user(question: str, tool_result: str | None) -> str:
 
 
 def _parse_reflect_empty(raw: str) -> dict:
-    """解析 reflect_empty 的 LLM 输出：{"action": "confirm"|"relax", "reason": "..."}。
+    """Parse reflect_empty's LLM output: {"action": "confirm"|"relax", "reason": "..."}.
 
-    只接受 confirm/relax 二选一，不接受 LLM 提供的 new_window——
-    放宽窗口是确定性的（见 reflect_empty_node），防止 LLM 为出数悄悄改口径。
+    Accepts only confirm/relax (no LLM-supplied new_window) — the relax window is deterministic,
+    so the LLM can't quietly change calibers to force a number.
     """
     import re as _re
 
@@ -153,10 +153,9 @@ def _parse_reflect_empty(raw: str) -> dict:
 
 
 def _relax_window(sq: SemanticQuery) -> SemanticQuery | None:
-    """确定性放宽窗口：单日 → 该日所在月；month 已最宽 → 返回 None（不放宽）。
+    """Deterministic window relax: single day → its month; month (widest) → None (no relax).
 
-    放宽是确定性规则而非 LLM 自选，杜绝「为出数悄悄改口径」——
-    只允许「单日查空 → 看当月整体」这一种合理放宽，且保持 metric/dimensions/filters 不变。
+    Only one relax is allowed — day-empty → whole month — with metric/dimensions/filters unchanged.
     """
     if sq.window.type == "month":
         return None
@@ -176,13 +175,13 @@ class DsaiGraph:
         self.tracer = pipeline.tracer
         self._vector_store = pipeline._vector_store
         self._reranker = pipeline._reranker
-        self._t = None  # 当前 trace session（answer() 入口设置，节点 span 用）
+        self._t = None  # current trace session (set at answer entry, used by node spans)
         self._use_alt = False
         self._checkpointer = MemorySaver()
         self._build_tools()
         self._graph = self._build_graph()
 
-    # ---------- SQL 三工具（@tool + ToolNode 错误包装） ----------
+    # ---------- three SQL tools (@tool + ToolNode error wrapping) ----------
 
     def _build_tools(self) -> None:
         executor = self.executor
@@ -243,10 +242,10 @@ class DsaiGraph:
         self._inventory_tool, self._marketing_tool = self._tools[3:]
 
     def _call_tool(self, name: str, args: dict, msgs: list, config) -> tuple[str | None, str | None]:
-        """调用工具；错误包装成 ToolMessage「Error: …」回灌纠错轨，返回 (error, result)。
+        """Call a tool; wrap errors into ToolMessage「Error: …」for the repair track. Returns (error, result).
 
-        诊断工具（inventory_tool/marketing_tool）直接调用底层函数（绕过 ToolNode 的
-        checkpointer config 依赖）；SQL 三工具走 ToolNode（图内 tools_node 复用）。
+        Diagnostic tools (inventory/marketing) call the underlying function directly (bypassing
+        ToolNode's checkpointer-config dependency); the three SQL tools go through ToolNode.
         """
         if name in ("inventory_tool", "marketing_tool"):
             try:
@@ -267,14 +266,14 @@ class DsaiGraph:
             return content, None
         return None, content
 
-    # ---------- 诊断工具可选调用（阶段 3-4E） ----------
+    # ---------- optional diagnostic-tool call (stage 3-4E) ----------
 
     def _tool_schemas(self) -> list[dict]:
-        """OpenAI 兼容的工具定义（给 LLM 可选调用）。
+        """OpenAI-compatible tool definitions (for optional LLM tool calls).
 
-        手工构造（不用 convert_to_openai_function）：`args: dict` 会被 langchain
-        转成 v__args 列表，丢失内部 JSON Schema。这里直接从工具模块的入参
-        JSON Schema 构造，保证 LLM 看到正确的参数定义。
+        Built by hand (not convert_to_openai_function): ``args: dict`` becomes a v__args list under
+        langchain, losing the inner JSON Schema. Construct directly from each tool module's args
+        schema so the LLM sees the correct parameter definition.
         """
         from tools.inventory import INVENTORY_ARGS_SCHEMA
         from tools.marketing import MARKETING_ARGS_SCHEMA
@@ -294,14 +293,10 @@ class DsaiGraph:
             }},
         ]
 
-    _TOOL_MAX_ROUNDS = 2  # generate 内工具调用循环上限（防 agnes 重复 tool_calls 烧 token）
+    _TOOL_MAX_ROUNDS = 2  # cap on in-generate tool-call loops (against agnes duplicate tool_calls burning tokens)
 
     def _tool_system_prompt(self, state: AgentState) -> str:
-        """工具轮 system prompt：语义查询 JSON 契约打底 + 工具调用规则。
-
-        基础 prompt（build_system_prompt）已含指标口径/值字典/JSON 契约——
-        LLM 在工具报错或不足时能回落到合法语义查询 JSON，不编造数字。
-        """
+        """Tool-round system prompt: semantic-query JSON contract + tool-call rules."""
         today = self.cfg.reference_date or date.today().isoformat()
         base = build_system_prompt(self.p.layer, state["schema_text"], today)
         return (
@@ -320,7 +315,7 @@ class DsaiGraph:
 
     @staticmethod
     def _extract_chart(res: str) -> str:
-        """从工具返回 JSON 提取 Plotly figure JSON（无图返回空串，供 app 渲染）。"""
+        """Extract the Plotly figure JSON from a tool-return JSON (empty when no chart)."""
         try:
             payload = json.loads(res)
             chart = payload.get("chart") or {}
@@ -331,15 +326,15 @@ class DsaiGraph:
         return ""
 
     def _run_tool_round(self, state: AgentState, llm, config) -> tuple[dict, str | None, SemanticQuery | None]:
-        """一轮「LLM 可选调工具」：返回 (state 更新 dict, 洞察答案或 None, 语义查询或 None)。
+        """One round of "LLM may call tools": returns (state updates, insight answer or None, query or None).
 
-        流程：带 tools 调 LLM → 若返回 tool_calls 则执行工具（去重）→ 把 ToolResult 回灌 LLM →
-        LLM 收敛输出最终答案（洞察式）或语义查询 JSON。工具错误经 ToolMessage 回灌纠错轨。
+        Flow: call the LLM with tools → if tool_calls, execute them (dedup) → feed the ToolResult back
+        → the LLM converges on a final answer (insight) or a semantic-query JSON.
 
-        返回值二选一（按优先级）：
-        - tool_answer 非 None → 工具洞察答案直接产出（走 answer，跳过语义查询链路）
-        - sq 非 None → 工具轮已收敛出合法语义查询 JSON（generate_node 直接用，不再二次生成）
-        两者皆 None → 工具轮未产出（应只发生在未进工具轮，调用方无需处理）。
+        Returns by priority:
+        - tool_answer non-None → insight answer produced directly (→ answer, skips semantic query)
+        - sq non-None → the round converged on a valid semantic-query JSON (generate_node uses it directly)
+        - both None → the round produced nothing (only when not entering the tool round)
         """
         msgs = list(state.get("messages", []))
         start = len(msgs)
@@ -353,54 +348,55 @@ class DsaiGraph:
                 self._tool_system_prompt(state),
                 _build_tool_user(state["question"], tool_answer), schemas)
             if not tool_calls:
-                # LLM 未调工具 → 输出是语义查询 JSON 或洞察答案文本
+                # LLM didn't call a tool → output is a semantic-query JSON or insight-answer text
                 if _looks_like_json(content):
                     try:
                         sq = self.p._parse_semantic_query(content)
                     except Exception:
-                        tool_answer = content  # 不是合法 JSON → 当洞察答案
+                        tool_answer = content  # not valid JSON → treat as insight answer
                     else:
                         if used_tool:
                             upd["tool_used"] = used_tool
-                        return upd, None, sq  # 语义查询链路（工具信息已记录）
+                        return upd, None, sq  # semantic-query path (tool info recorded)
                 else:
-                    # 纯文本 → 洞察答案
-                    tool_answer = content or tool_answer
+                    tool_answer = content or tool_answer  # plain text → insight answer
                 break
-            # 有 tool_calls：去重后执行
+            # has tool_calls: dedup then execute
             seen: set = set()
             last_res: str | None = None
             for tc in tool_calls:
                 name = tc["name"]
                 key = (name, json.dumps(tc.get("arguments", {}), sort_keys=True))
                 if key in seen:
-                    continue  # agnes 偶发重复 tool_calls → 只执行一次
+                    continue  # agnes occasionally duplicates tool_calls → execute once only
                 seen.add(key)
                 used_tool = name
                 err, res = self._call_tool(name, tc["arguments"], msgs, config)
                 last_res = f"工具调用失败：{err}" if err else res
                 if err is None and res:
                     upd["_tool_chart"] = self._extract_chart(res)
-            tool_answer = last_res  # 完整 ToolResult JSON 或错误文本回灌下一轮收敛
+            tool_answer = last_res  # full ToolResult JSON or error text fed back for the next round
         if used_tool:
             upd["tool_used"] = used_tool
         upd["messages"] = msgs[start:]
-        # 工具调用失败且 LLM 未收敛 → 回落到语义查询链路（不让原始错误当最终答案）
+        # tool failed and LLM didn't converge → fall back to semantic-query path (no raw error as the answer)
         if tool_answer and (tool_answer.startswith("工具调用失败") or tool_answer.startswith("Error:")):
             return upd, None, None
         return upd, tool_answer, sq
 
-    # ---------- 节点 ----------
+    # ---------- nodes ----------
 
     def _span(self, name: str, **kw):
-        """包一层 Langfuse span（未启用时 Noop）。"""
+        """Wrap a Langfuse span (no-op when tracing is off)."""
         if self._t is not None:
             return self._t.span(name, **kw)
         return _NullCtx()
 
     def intent_node(self, state: AgentState) -> dict:
         ref = date.fromisoformat(self.cfg.reference_date) if self.cfg.reference_date else date.today()
-        q = rewrite(state["question"], ref)
+        q = rewrite(state["question"], ref)  # deterministic time completion
+        # three-layer RAG rewrite: coreference (history) / synonym / intent — before retrieval
+        q = rewrite_query(q, history=state.get("history"), llm=self.p._get_llm(self._use_alt))
         intent = _classify_intent(q)
         return {"question": q, "intent": intent}
 
@@ -414,11 +410,11 @@ class DsaiGraph:
                         state["question"], self._vector_store, top_tables=3,
                         vector_n=10, reranker=self._reranker)
                 except Exception as e:
-                    # embedding 网络故障降级：纯关键词检索（记录进 trace，不崩溃）
+                    # embedding network failure → pure-keyword fallback (recorded, no crash)
                     degraded = True
                     tables = self.retriever.retrieve_keyword_only(state["question"])
             if not tables:
-                tables = self.retriever.retrieve(state["question"])  # 最终回退硬编码
+                tables = self.retriever.retrieve(state["question"])  # final hardcoded fallback
             schema_text, _ = render_tables_budgeted(tables, RETRIEVAL_BUDGET)
             return {
                 "retrieved_tables": [t["table"] for t in tables],
@@ -427,13 +423,13 @@ class DsaiGraph:
             }
 
     def generate_node(self, state: AgentState, config=None) -> dict:
-        # reflect 已重写语义查询：透传（不再调 LLM 覆盖修复结果），直接进 tools 重编译验证
+        # reflect already rewrote the query: pass through (no LLM override), straight to tools recompile
         if state.get("_reflect_fixed"):
             return {"execution_error": None, "_reflect_fixed": False}
         with self._span("generate", input={"retry": state.get("retry_count")}):
             llm = self.p._get_llm(self._use_alt)
-            # 工具可选调用轮（阶段 3-4E）：仅当意图路由命中诊断域（库存/营销漏斗）才进工具轮，
-            # 避免普通问题多一次带 tools 的 LLM 调用（token 开销 / 误触发）
+            # optional tool-call round (stage 3-4E): only when intent routing hits a diagnostic domain
+            # (inventory/marketing funnel), avoiding an extra tools-armed LLM call for ordinary questions
             upd: dict = {}
             tool_answer: str | None = None
             sq: SemanticQuery | None = None
@@ -441,11 +437,11 @@ class DsaiGraph:
             if intent.hit or intent.needs_llm:
                 upd, tool_answer, sq = self._run_tool_round(state, llm, config)
             if tool_answer is not None:
-                # 工具洞察答案：直接走 answer，跳过语义查询链路
+                # insight answer: go straight to answer, skip the semantic-query path
                 return {**upd, "tool_answer": tool_answer, "semantic_query": None,
                         "execution_error": None, "stage": "tool"}
             if sq is not None:
-                # 工具轮已收敛出合法语义查询 JSON：直接进 validate/tools，不再二次生成
+                # tool round converged on a valid semantic-query JSON: straight to validate/tools
                 return {**upd, "semantic_query": sq, "execution_error": None}
             today = self.cfg.reference_date or date.today().isoformat()
             question = state["question"]
@@ -456,7 +452,7 @@ class DsaiGraph:
             try:
                 sq, raw, attempts = self.p._generate(question, state["schema_text"], llm, today)
             except BudgetExceeded:
-                raise  # 熔断：透传让 answer 捕获降级，不吞成普通失败
+                raise  # budget: pass through so answer() degrades rather than swallowing it
             except Exception as e:
                 return {"semantic_query": None, "execution_error": f"LLM 调用失败: {e}"}
             return {**upd, "semantic_query": sq, "execution_error": None}
@@ -469,45 +465,45 @@ class DsaiGraph:
             upd: dict = {}
             sq = state.get("semantic_query")
             if sq is not None:
-                # 1) 编译
+                # 1) compile
                 err, sql = self._call_tool("compile_tool",
                                            {"semantic_query": sq.model_dump()}, msgs, config)
                 if err:
                     errors.append(err)
                 else:
                     upd["compiled_sql"] = sql
-                    # 2) 干跑
+                    # 2) dry-run
                     err, _ = self._call_tool("dry_run_tool", {"sql": sql}, msgs, config)
                     if err:
                         errors.append(err)
                     else:
-                        # 3) 执行
+                        # 3) execute
                         err, res = self._call_tool("execute_tool", {"sql": sql}, msgs, config)
                         if err:
                             errors.append(err)
                         else:
                             upd["execution_result"] = _parse_result(res)
-            # add_messages reducer 会追加，只返回本轮新增消息
+            # add_messages reducer appends; return only this round's new messages
             return {**upd, "errors": errors, "messages": msgs[start:]}
 
     def validate_node(self, state: AgentState) -> dict:
-        """前置校验（编译前）：四层预检 + 相关性/意图校验。
+        """Pre-check (before compile): four-layer preflight + relevance/intent check.
 
-        预检（preflight）：日期边界/枚举字典/粒度回退/时效 cutoff——确定性拦截可预见的失败；
-        相关性（check_relevance）：DSL 外实体 → hallucination（降级）；粒度错位 → intent_mismatch（repair）。
-        全部通过才进 tools 编译执行，避免无效 LLM 重试与无效编译。
+        preflight: date boundary / enum dictionary / granularity fallback / cutoff — deterministic
+        interception; relevance (check_relevance): DSL-unsupported entity → hallucination (degrade),
+        granularity mismatch → intent_mismatch (repair). Only pass through to tools on success.
         """
         q = state.get("question", "")
         sq = state.get("semantic_query")
         if sq is None:
             return {"hallucination": False, "intent_mismatch": False,
                     "preflight_kind": "pass", "preflight_reason": ""}
-        # 第一层：四层预检（确定性，零 LLM）
+        # layer 1: four-layer preflight (deterministic, zero LLM)
         cutoff = self.layer.context.get("visible_data_cutoff")
         try:
             verdict = preflight(sq, self.layer, cutoff=cutoff)
         except Exception as e:
-            # 预检异常不崩溃：降级拦截（诚实告知），交由降级回答
+            # preflight crash → block + degrade (honest), don't crash the graph
             return {"hallucination": False, "intent_mismatch": False,
                     "preflight_kind": "cutoff",
                     "preflight_reason": f"预检异常：{e}",
@@ -516,23 +512,23 @@ class DsaiGraph:
             with self._span("validate", output={"kind": verdict.kind,
                                                 "reason": verdict.reason[:120]}):
                 if verdict.kind == "cutoff":
-                    # 窗口超出可见数据截止：拦截降级（不静默查空）
+                    # window past the visible data cutoff → block + degrade (not silently empty)
                     return {"hallucination": False, "intent_mismatch": False,
                             "preflight_kind": "cutoff",
                             "preflight_reason": verdict.reason,
                             "execution_error": verdict.reason}
                 if verdict.kind == "granularity":
-                    # 维度/指标组合非法：回灌修复（repair 轨）
+                    # illegal dimension/metric combo → feed back to repair
                     return {"hallucination": False, "intent_mismatch": True,
                             "preflight_kind": "granularity",
                             "preflight_reason": verdict.reason,
                             "error_feedback": verdict.reason + " " + verdict.suggestion}
-                # date / enum：值/格式非法 → 回灌修复
+                # date / enum: invalid value/format → feed back to repair
                 return {"hallucination": False, "intent_mismatch": True,
                         "preflight_kind": verdict.kind,
                         "preflight_reason": verdict.reason,
                         "error_feedback": verdict.reason + " " + verdict.suggestion}
-        # 第二层：相关性/意图校验
+        # layer 2: relevance/intent check
         rel = check_relevance(q, sq.metric, sq.dimensions, sq.filters)
         with self._span("validate", output={"kind": rel.kind,
                                             "reason": rel.reason}):
@@ -548,21 +544,21 @@ class DsaiGraph:
                     "preflight_kind": "pass", "preflight_reason": ""}
 
     def judge_node(self, state: AgentState) -> dict:
-        """judge 图节点（validate 后·编译前）：预检/相关性判定，供条件路由。"""
+        """judge node (after validate, before compile): preflight/relevance verdict for routing."""
         stage = self._judge_pre_cond(state)
         with self._span("judge", output={"stage": stage,
                                          "preflight": state.get("preflight_kind")}):
             return {"stage": stage}
 
     def judge_post_node(self, state: AgentState) -> dict:
-        """judge 图节点（tools 后·编译执行后）：执行结果判定。"""
+        """judge node (after tools, post compile/execute): execution verdict."""
         stage = self._judge_cond(state)
         with self._span("judge", output={"stage": stage,
                                          "n_errors": len(state.get("errors", []))}):
             return {"stage": stage}
 
     def _judge_pre_cond(self, state: AgentState) -> Literal["answer", "repair", "tools"]:
-        """validate 后（编译前）路由：幻觉/预检 cutoff → 降级；粒度错位/预检可修 → repair；通过 → tools。"""
+        """post-validate (pre-compile) routing: hallucination/cutoff → degrade; fixable → repair; pass → tools."""
         if state.get("hallucination"):
             return "answer"
         if state.get("preflight_kind") == "cutoff":
@@ -572,14 +568,14 @@ class DsaiGraph:
         return "tools"
 
     def _judge_cond(self, state: AgentState) -> Literal["answer", "repair", "degrade", "reflect_empty"]:
-        """tools 后（编译执行后）判定优先级：
-        幻觉→degrade；执行过返回空列表且未放宽→reflect_empty；粒度错位→repair；
-        成功→answer；生成失败→degrade；重试耗尽→degrade；有错→repair。"""
+        """post-tools (post compile/execute) priority:
+        hallucination→degrade; empty result not yet relaxed→reflect_empty; granularity→repair;
+        success→answer; generation failed→degrade; retries exhausted→degrade; errors→repair."""
         if state.get("hallucination"):
             return "degrade"
         if state.get("intent_mismatch") and state.get("retry_count", 0) < state.get("max_retries", MAX_RETRIES):
             return "repair"
-        # 空结果反思：仅当「执行过且返回空列表」且未放宽过才触发（None=未执行，走后续判定）
+        # empty-result reflection: only when "executed and returned []" and not yet relaxed
         if isinstance(state.get("execution_result"), list) \
                 and len(state.get("execution_result")) == 0:
             if not state.get("_relaxed") and state.get("relax_attempts", 0) < MAX_RETRIES:
@@ -596,9 +592,9 @@ class DsaiGraph:
         return "answer"
 
     def repair_node(self, state: AgentState) -> dict:
-        """错误三分类分级。坑点①铁律：严禁直接补丁 SQL 文本——所有修复落语义查询层再重编译。
-        粒度错位（intent_mismatch）不属编译错，跳过错误分类，直接计重试次数。"""
-        # 粒度错位：不分类、不 try_repair，直接推进到 reflect 补维度
+        """Error three-way classification. Rule ①: never patch SQL text directly — all fixes land at the
+        semantic-query layer and recompile. Granularity mismatch isn't a compile error → skip classification."""
+        # granularity mismatch: skip classification / try_repair, advance straight to reflect to add a dimension
         if state.get("intent_mismatch"):
             return {"retry_count": state.get("retry_count", 0) + 1}
         with self._span("repair", input={"n_errors": len(state.get("errors", []))}):
@@ -620,17 +616,15 @@ class DsaiGraph:
             }
 
     def reflect_empty_node(self, state: AgentState) -> dict:
-        """空结果反思：查询执行返回空结果（[]）时，让 LLM 判定是真无数据还是窗口可放宽。
+        """Empty-result reflection: when execution returns [], let the LLM decide true-no-data vs relaxable.
 
-        返回两种动作：
-        - relax：确定性放宽窗口（单日 → 该日所在月）重查，设 _relaxed 重查。
-          放宽是确定性规则而非 LLM 自选窗口，杜绝「为出数悄悄改口径」——
-          LLM 只判二选一，不提供 new_window。
-        - confirm：确认该窗口确实无数据 → 诚实降级（answer 渲染「无数据」，不猜测填充）
+        Two actions:
+        - relax: deterministically widen the window (day → its month), set _relaxed and re-query.
+        - confirm: that window truly has no data → honest degrade (answer renders "no data").
         """
         sq = state.get("semantic_query")
         if sq is None:
-            # 无语义查询却空结果：直接诚实降级（不反思）
+            # empty result without a query: degrade honestly (no reflection)
             return {"empty_result": True, "error_feedback": "无有效语义查询，按确认无数据降级"}
         with self._span("reflect_empty", input={"metric": sq.metric,
                                                 "window": sq.window.value,
@@ -656,31 +650,31 @@ class DsaiGraph:
                 if decision["action"] == "relax":
                     new_sq = _relax_window(sq)
                     if new_sq is None:
-                        # 月窗口已是最宽语义，不放宽 → 确认无数据
+                        # month window is already widest → confirm no data
                         return {"empty_result": True,
                                 "error_feedback": f"空结果反思：{sq.window.type} 窗口已最宽，确认无数据（{decision.get('reason', '')}）"}
                     return {"semantic_query": new_sq, "_relaxed": True,
-                            "_reflect_fixed": True,  # 透传 new_sq 直接重编译，不让 LLM 覆盖
+                            "_reflect_fixed": True,  # pass new_sq straight to recompile, no LLM override
                             "relax_attempts": state.get("relax_attempts", 0) + 1,
                             "execution_result": None,
                             "empty_result": False,
                             "error_feedback": f"空结果反思：窗口放宽到 {new_sq.window.value}（{decision.get('reason', '')}）"}
-                # confirm：确认无数据，诚实降级
+                # confirm: no data → honest degrade
                 return {"empty_result": True,
                         "error_feedback": f"空结果反思确认：{decision.get('reason', '该窗口无数据')}"}
             except BudgetExceeded:
-                raise  # 熔断：透传给 answer 降级
+                raise  # budget: pass to answer to degrade
             except Exception as e:
-                # 反思失败：不猜测，诚实降级
+                # reflection failed: don't guess, degrade honestly
                 return {"empty_result": True,
                         "error_feedback": f"空结果反思失败（{e}），按确认无数据降级"}
 
     def reflect_node(self, state: AgentState) -> dict:
-        """按错误类型反思：粒度错位→回灌补维度；引用/逻辑/方言→LLM 重写语义查询 JSON。"""
+        """Reflect by error type: granularity → feed back to add a dimension; reference/logic/dialect → LLM rewrite."""
         categories = state.get("error_categories", [])
         cat = categories[-1] if categories else "unknown"
         feedback = state.get("error_feedback", "")
-        # 粒度错位：问题要求分组/过滤但查询无维度 → 回灌让 LLM 补合法维度
+        # granularity mismatch: question asks grouping/filtering but query has none → feed back to add a dim
         if state.get("intent_mismatch"):
             with self._span("reflect", output={"kind": "granularity",
                                                "reason": feedback[:150]}):
@@ -700,11 +694,11 @@ class DsaiGraph:
                             "intent_mismatch": False,
                             "error_feedback": feedback + "\n（已补维度重写）"}
                 except BudgetExceeded:
-                    raise  # 熔断：透传给 answer 降级
+                    raise  # budget: pass to answer to degrade
                 except Exception:
                     return {"intent_mismatch": False,
                             "error_feedback": feedback + "\n（补维度重写失败，降级）"}
-        # 引用/逻辑/方言/未知错：LLM 按分类 prompt 直接重写语义查询 JSON
+        # reference/logic/dialect/unknown: LLM rewrites the query via the category prompt
         cls_records = state.get("error_classifications", [])
         reason = cls_records[-1].get("reason", "") if cls_records else ""
         with self._span("reflect", input={"feedback": feedback[:200], "category": cat,
@@ -717,24 +711,24 @@ class DsaiGraph:
             try:
                 raw = llm.complete(system, user)
                 sq = self.p._parse_semantic_query(raw)
-                # 重写成功：标记跳过 generate，直接进 tools 用修复后的语义查询重编译验证
+                # rewrite succeeded: mark to skip generate, straight to tools with the fixed query
                 return {"semantic_query": sq, "_reflect_fixed": True,
                         "error_feedback": feedback + "\n（已重写语义查询）"}
             except BudgetExceeded:
-                raise  # 熔断：透传给 answer 降级
+                raise  # budget: pass to answer to degrade
             except Exception:
-                # 重写失败：保留原错误反馈，让 generate 自行尝试修正
+                # rewrite failed: keep the original error feedback, let generate retry
                 return {"error_feedback": feedback}
 
     def answer_node(self, state: AgentState) -> dict:
         with self._span("answer", output={"stage": state.get("stage")}):
             sq = state.get("semantic_query")
-            # 工具洞察答案（阶段 3-4E）：诊断工具直接产出，跳过语义查询链路
+            # tool insight answer (stage 3-4E): produced directly by a diagnostic tool
             if state.get("tool_answer"):
                 return {"answer": (
                     f"【诊断工具洞察】（{state.get('tool_used') or '工具'}）\n"
                     f"{state['tool_answer']}")}
-            # 空结果（执行过返回空列表，且无执行错误）：诚实渲染「无数据」，不猜测填充
+            # empty result (executed and returned [], no execution error): honestly render "no data"
             empty = isinstance(state.get("execution_result"), list) \
                 and len(state.get("execution_result")) == 0
             if not state.get("execution_error") and (state.get("empty_result") or empty):
@@ -747,19 +741,19 @@ class DsaiGraph:
                     f"{window} 无数据 {relaxed_note}\n"
                     f"{reason}\n"
                     "说明：查询如实执行，未做数据猜测或填充。")}
-            # 正常完成：语义查询有效且无错误（execution_result 可为 None=无数据，_assemble_answer 处理）
+            # normal completion: query valid, no errors (execution_result may be None; _assemble_answer handles it)
             if sq is not None and not state.get("errors") and not state.get("execution_error") \
                     and not state.get("hallucination"):
                 answer = self.p._assemble_answer(
                     sq, state.get("execution_result"),
                     state["retrieved_tables"], state.get("compiled_sql"))
-                # ②灵魂风险：放宽口径出数必须披露——单日查空放宽到当月拿到数时，答案明示口径变化
+                # soul risk ②: a relaxed caliber must be disclosed when yielding a number
                 if state.get("_relaxed"):
                     note = state.get("error_feedback", "")
                     answer = (f"{answer}\n\n⚠ 口径说明：原始单日窗口无数据，"
                               f"已将窗口放宽到 {sq.window.value} 后给出当月数据。\n{note}")
                 return {"answer": answer}
-            # 幻觉拦截：明确提示问题超出可答范围（意图错位），不返回错数据
+            # hallucination block: question is out of answerable range, return no wrong data
             if state.get("hallucination"):
                 hint = (state.get("execution_error")
                         or "问题包含语义层无法表达的实体（如订单号/状态明细），无法回答")
@@ -767,13 +761,13 @@ class DsaiGraph:
                     f"无法回答：该问题超出了当前可查询范围。\n"
                     f"原因：{hint}\n"
                     "建议：改为按月份/品类/渠道/城市等维度查询聚合指标（GMV/订单数/退款率等）。")}
-            # 时效 cutoff 拦截：数据未到可见边界，诚实说明而非静默查空
+            # cutoff block: data hasn't reached the visible boundary — honest, not silently empty
             if state.get("preflight_kind") == "cutoff":
                 return {"answer": (
                     f"无法回答：查询窗口超出数据可见范围。\n"
                     f"原因：{state.get('preflight_reason') or state.get('execution_error', '')}\n"
                     "说明：数据仅更新到可见截止日，之后窗口无数据可查，不做猜测填充。")}
-            # 降级：明确提示 + 已试 SQL + 错误摘要 + 建议人工介入
+            # degrade: explicit note + tried SQL + error summary + manual-intervention advice
             err = (state.get("execution_error")
                    or (state["errors"][-1] if state.get("errors") else "未知错误"))
             error_summary = err[:300]
@@ -790,16 +784,16 @@ class DsaiGraph:
             )
             return {"answer": f"无法回答：{advice}"}
 
-    # ---------- 图构建 ----------
+    # ---------- graph construction ----------
 
     def _tool_answer_cond(self, state: AgentState) -> Literal["answer", "validate"]:
-        """generate 后路由：工具洞察答案（tool_answer 非空）→ 直达 answer；否则进 validate 预检。"""
+        """post-generate routing: tool insight answer (tool_answer non-empty) → answer; else validate."""
         if state.get("tool_answer"):
             return "answer"
         return "validate"
 
     def _reflect_empty_cond(self, state: AgentState) -> Literal["generate", "answer"]:
-        """reflect_empty 后路由：已放宽窗口 → 重查；confirm → 诚实降级回答。"""
+        """post-reflect_empty routing: relaxed window → re-query; confirm → honest degrade."""
         if state.get("_relaxed") and not state.get("empty_result"):
             return "generate"
         return "answer"
@@ -811,8 +805,8 @@ class DsaiGraph:
         g.add_node("generate", self.generate_node)
         g.add_node("tools", self.tools_node)
         g.add_node("validate", self.validate_node)
-        g.add_node("judge", self.judge_node)            # 编译前（validate 后）
-        g.add_node("judge_post", self.judge_post_node)  # 编译后（tools 后）
+        g.add_node("judge", self.judge_node)            # pre-compile (after validate)
+        g.add_node("judge_post", self.judge_post_node)  # post-compile (after tools)
         g.add_node("repair", self.repair_node)
         g.add_node("reflect", self.reflect_node)
         g.add_node("reflect_empty", self.reflect_empty_node)
@@ -821,7 +815,7 @@ class DsaiGraph:
         g.add_edge(START, "intent")
         g.add_edge("intent", "retrieve")
         g.add_edge("retrieve", "generate")
-        # 工具洞察答案（阶段 3-4E）直达 answer；否则 validate 前置到编译前
+        # tool insight answer (stage 3-4E) goes straight to answer; else validate runs before compile
         g.add_conditional_edges(
             "generate", self._tool_answer_cond,
             {"answer": "answer", "validate": "validate"},
@@ -846,9 +840,10 @@ class DsaiGraph:
         g.add_edge("answer", END)
         return g.compile(checkpointer=self._checkpointer)
 
-    # ---------- 入口 ----------
+    # ---------- entry ----------
 
-    def answer(self, question: str, *, use_alt: bool = False) -> dict:
+    def answer(self, question: str, *, use_alt: bool = False,
+               thread_id: str | None = None, history: list[dict] | None = None) -> dict:
         today = self.cfg.reference_date or date.today().isoformat()
         state: AgentState = {
             "question": question,
@@ -879,6 +874,7 @@ class DsaiGraph:
             "tool_used": "",
             "_tool_chart": "",
             "messages": [],
+            "history": history or [],
             "answer": "",
             "trace_id": "",
         }
@@ -888,16 +884,17 @@ class DsaiGraph:
             t.set_trace_io(input={"question": question})
             config = {
                 "configurable": {
-                    "thread_id": f"{uuid.uuid4().hex[:12]}",  # 每问独立会话，checkpointer 存档
+                    # stable per-conversation thread_id retains the message channel across turns
+                    "thread_id": thread_id or uuid.uuid4().hex[:12],
                 },
                 "recursion_limit": RECURSION_LIMIT,
             }
-            monitor = self.p.begin_question()  # 三层熔断：轮次/token/超时
-            final = dict(state)  # 兜底：任何异常路径下 finally 均可安全访问
+            monitor = self.p.begin_question()  # three-layer budget: rounds/tokens/timeout
+            final = dict(state)  # fallback: safely accessible in finally on any exception path
             try:
                 final = self._graph.invoke(state, config)
             except BudgetExceeded as e:
-                # 预算熔断：诚实告知预算耗尽，不静默截断（trace 已含此前各节点 span）
+                # budget cut: honestly report exhaustion, no silent truncation
                 err = f"单问预算耗尽被熔断：{e}"
                 final = dict(state)
                 final["execution_error"] = err
@@ -910,7 +907,7 @@ class DsaiGraph:
                 with self._span("judge", output={"stage": "degrade", "budget_exceeded": True}):
                     final["stage"] = "degrade"
             except GraphRecursionError as e:
-                # 递归超限不静默：记录真实错误并降级回答（Langfuse 已含此前各节点 span）
+                # recursion overrun: record the real error and degrade (Langfuse has the prior spans)
                 err = f"递归深度超限（{RECURSION_LIMIT} 步，可能纠错循环未收敛）: {e}"
                 final = dict(state)
                 final["execution_error"] = err
@@ -919,8 +916,8 @@ class DsaiGraph:
                 with self._span("judge", output={"stage": "degrade", "recursion_exceeded": True}):
                     final["stage"] = "degrade"
             finally:
-                final.setdefault("budget", monitor.snapshot())  # _timed：预算快照进 final
-                final = _jsonable_state(final)  # ③ 序列化闸：剔除 pydantic/消息对象
+                final.setdefault("budget", monitor.snapshot())  # budget snapshot into final
+                final = _jsonable_state(final)  # serialization guard: drop pydantic/message objects
                 self.p.end_question()
                 self._t = None
         final["trace_id"] = t.trace_id

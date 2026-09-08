@@ -1,11 +1,12 @@
-"""retrieval/retriever.py：检索器（v1 向量 / v2 混合检索）。
+"""retrieval/retriever.py：retriever (v1 vector / v2 hybrid).
 
-- 阶段一：硬编码 Top-3（orders/order_items/refunds）注入；
-- 阶段二 v1：向量召回（ChromaDB）Top-k 表文档；
-- 阶段二 v2：混合检索——向量召回 Top-N + 表名/关键词精确加权，RRF 融合取 Top-k；
-  可选 jina rerank 重排。
+- stage 1: hardcoded Top-3 (orders/order_items/refunds);
+- stage 2 v1: vector recall (ChromaDB) Top-k table docs;
+- stage 2 v2: hybrid — vector recall Top-N + table-name/keyword exact weighting, RRF fusion → Top-k;
+  optional jina rerank.
 
-v2 动机：catalog 干扰表与表名强信号问题（纯向量对表名不敏感，见 ACCURACY.md）。
+v2 motivation: catalog decoy tables and table-name strong signal (pure vectors are insensitive to
+table names, see ACCURACY.md).
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ from pathlib import Path
 
 from data.tables import has_data
 
-# 阶段一硬编码 Top-3（月度 GMV/净销/复购率评测所需表）
+# stage-1 hardcoded Top-3 (tables needed for monthly GMV/net-sales/repurchase eval)
 TOP3_KEYS = ["ods.orders", "ods.order_items", "ods.refunds"]
 
-# 中文业务词 → 强关联表名关键词（表名/字段名命中加权）
+# Chinese business word → strongly-related table-name keywords (table/field name hit weighting)
 DOMAIN_TERMS = {
     "订单": ["order"], "退款": ["refund"], "支付": ["pay"], "发货": ["order_status_log"],
     "sku": ["product", "sku"], "商品": ["product"], "品类": ["categor"],
@@ -34,19 +35,19 @@ DOMAIN_TERMS = {
     "销量": ["order_items", "order"], "成交额": ["order"],
     "时间": ["dim_date"], "季度": ["dim_date", "order"], "城市": ["user"],
 }
-# 问题含这些词 → 订单表强召回（score 再加 3，伪 rank 1）
+# question contains these → force-recall the orders table (score +3, pseudo rank 1)
 ORDER_FORCE_WORDS = ("复购", "净销售额", "销量", "卖得最好", "大促", "GMV", "成交额", "毛利")
 
 
 def _is_catalog(table: str) -> bool:
-    """catalog 表：无数据（has_data=False，datagen 模板池生成 0 行空表）。"""
+    """catalog table: no data (has_data=False, datagen template pool 0-row empty table)."""
     return not has_data(table)
 
 
 def _keyword_rank(question: str, doc: dict) -> float:
-    """基于问题业务词 → 表名/字段/描述 的关键词加权分。
+    """Keyword weighting: business word → table name / field / description.
 
-    catalog 干扰表不参与关键词加分（避免 ods_channel_agg 这类相似名被误抬）。
+    catalog decoy tables get no keyword boost (so similar names like ods_channel_agg don't get bumped).
     """
     if _is_catalog(doc.get("table", "")):
         return 0.0
@@ -57,16 +58,16 @@ def _keyword_rank(question: str, doc: dict) -> float:
     desc = (doc.get("description", "") + " " + fields).lower()
     for term, keys in DOMAIN_TERMS.items():
         if term.lower() in q:
-            # 表名命中加权最高，字段/描述次之；订单/退款核心表权重更高
+            # table-name hit weighted highest, field/description next; order/refund core tables higher
             for k in keys:
                 if k in table_name.lower():
                     score += 3.0 if k in ("order", "refund") else 2.0
                 elif k in desc:
                     score += 1.0
-    # 订单强相关词：orders 表（表名含 order）额外 +3 → 必进 Top-1
+    # order-strong words: orders table (name contains order) extra +3 → guaranteed Top-1
     if any(w.lower() in q for w in ORDER_FORCE_WORDS) and "order" in table_name.lower():
         score += 3.0
-    # 表名直接包含问题里的英文词（如 sku_id）加分
+    # table name directly contains an English word from the question (e.g. sku_id)
     for word in re.findall(r"[a-z_]+", q):
         if word in table_name.lower():
             score += 1.5
@@ -75,13 +76,13 @@ def _keyword_rank(question: str, doc: dict) -> float:
 
 def _rrf_fuse(vector_ranks: dict[str, int], keyword_scores: dict[str, float],
               k: int = 60) -> list[str]:
-    """RRF 融合：向量排序 + 关键词加权（关键词强命中 → 高伪 rank，接近 Top-1）。"""
+    """RRF fusion: vector ranks + keyword weights (strong keyword hit → low pseudo-rank ≈ Top-1)."""
     fused: dict[str, float] = {}
     for tid, rank in vector_ranks.items():
         fused[tid] = fused.get(tid, 0.0) + 1.0 / (k + rank)
     for tid, score in keyword_scores.items():
         if score > 0:
-            # 关键词分 ≥3 → 伪 rank 3-5（强信号，接近向量 Top-1）；分低 → rank 8+
+            # keyword score >= 3 → pseudo-rank 3-5 (strong, near vector Top-1); lower → rank 8+
             pseudo_rank = max(1, 8 - int(score))
             fused[tid] = fused.get(tid, 0.0) + 1.0 / (k + pseudo_rank)
     return sorted(fused, key=fused.get, reverse=True)
@@ -93,13 +94,13 @@ class Retriever:
         self._docs = docs
 
     def retrieve(self, question: str, k: int = 3) -> list[dict]:
-        """阶段一：忽略 question，固定返回硬编码 Top-3。"""
+        """stage 1: ignore the question, return the fixed hardcoded Top-3."""
         return [self._docs[key] for key in TOP3_KEYS[:k]]
 
     def retrieve_vector(self, question: str, vector_store, *,
                         top_tables: int = 5,
                         where: dict | None = None) -> list[dict]:
-        """阶段二 v1：向量召回，过滤出表文档，返回 Top-k。"""
+        """stage 2 v1: vector recall, filter to table docs, return Top-k."""
         hits = vector_store.query(question, top_k=top_tables + 5, where=where)
         table_ids = [h["id"] for h in hits if h["doc_type"] == "table"]
         out = []
@@ -113,37 +114,25 @@ class Retriever:
     def retrieve_hybrid(self, question: str, vector_store, *,
                         top_tables: int = 3, vector_n: int = 10,
                         reranker=None) -> list[dict]:
-        """阶段二 v2：混合检索。
+        """stage 2 v2: hybrid retrieval.
 
-        - 向量召回 Top-N（N>K），记 rank；
-        - 关键词精确加权（表名/字段/描述命中）；
-        - RRF 融合 → Top-K 表文档；
-        - 可选 rerank 重排。
+        - vector recall Top-N (N > K), record rank;
+        - keyword exact weighting (table name / field / description);
+        - RRF fusion → Top-K table docs;
+        - optional rerank.
         """
         hits = vector_store.query(question, top_k=vector_n)
-        # 向量 rank（只算表文档）
+        # vector rank (table docs only)
         vector_ranks = {}
         for i, h in enumerate(hits):
             if h["doc_type"] == "table":
                 vector_ranks[h["id"]] = i  # 0-based
 
-        # 关键词加权（全库真实表计算，向量没召回的强命中也能进候选）
-        keyword_scores = {}
-        q_lower = question.lower()
-        for tid, doc in self._docs.items():
-            if _is_catalog(tid):
-                continue
-            kw = _keyword_rank(question, doc)
-            if kw > 0:
-                keyword_scores[tid] = kw
-            else:
-                table_name = doc.get("table", "").lower()
-                for word in re.findall(r"[a-z_]+", q_lower):
-                    if word in table_name and len(word) >= 4:
-                        keyword_scores[tid] = keyword_scores.get(tid, 0.0) + 1.5
+        # keyword weighting (over all real tables; a strong hit not vector-recalled still enters)
+        keyword_scores = self._keyword_scores(question, english_fallback=True)
 
         fused = _rrf_fuse(vector_ranks, keyword_scores)
-        # 优先真实表：catalog 干扰表（空表）不进注入 Top-K，用后续真实表替补
+        # real tables first: catalog decoy tables (empty) never enter Top-K, next real table backs up
         ranked_ids = [t for t in fused if t in self._docs]
         out_ids = []
         for t in ranked_ids:
@@ -156,23 +145,16 @@ class Retriever:
         if reranker and len(out) > 1:
             docs_txt = [Retriever._table_text(d) for d in out]
             ranked = reranker.rerank(question, docs_txt, top_n=len(out))
-            # rerank 返回 index 顺序，重排 out
             ordered = [out[i["index"]] for i in sorted(ranked, key=lambda x: x["score"], reverse=True)]
             out = ordered
         return out
 
     def retrieve_keyword_only(self, question: str, *, top_tables: int = 3) -> list[dict]:
-        """纯关键词检索（embedding 网络故障时降级，不依赖 vector_store）。
+        """Pure keyword retrieval (embedding failure fallback, no vector_store).
 
-        用关键词加权分排序取 Top-K 真实表。命中率低于混合检索，但可用。
+        Sorts real tables by keyword score and takes Top-K. Lower hit rate than hybrid, but usable.
         """
-        keyword_scores = {}
-        for tid, doc in self._docs.items():
-            if _is_catalog(tid):
-                continue
-            kw = _keyword_rank(question, doc)
-            if kw > 0:
-                keyword_scores[tid] = kw
+        keyword_scores = self._keyword_scores(question)
         ranked = sorted(keyword_scores, key=keyword_scores.get, reverse=True)
         out = []
         for tid in ranked:
@@ -180,6 +162,24 @@ class Retriever:
                 break
             out.append(self._docs[tid])
         return out
+
+    def _keyword_scores(self, question: str, *, english_fallback: bool = False) -> dict[str, float]:
+        """Keyword scores over all non-catalog docs."""
+        scores: dict[str, float] = {}
+        q_lower = question.lower()
+        for tid, doc in self._docs.items():
+            if _is_catalog(tid):
+                continue
+            kw = _keyword_rank(question, doc)
+            if kw > 0:
+                scores[tid] = kw
+            elif english_fallback:
+                # low-signal fallback: table name directly contains an English word (len >= 4)
+                table_name = doc.get("table", "").lower()
+                for word in re.findall(r"[a-z_]+", q_lower):
+                    if word in table_name and len(word) >= 4:
+                        scores[tid] = scores.get(tid, 0.0) + 1.5
+        return scores
 
     @staticmethod
     def _table_text(doc: dict) -> str:

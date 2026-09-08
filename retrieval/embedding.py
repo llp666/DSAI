@@ -1,8 +1,8 @@
-"""retrieval/embedding.py：embedding 适配层（provider 可切换）。
+"""retrieval/embedding.py：embedding adapter (swappable provider).
 
-- gitee Qwen3-Embedding（OpenAI 兼容，instruction 查询侧指令）
-- jina-embeddings-v5-omni-small（REST API，task=retrieval.query，1024 维）
-两实现同维度，可无缝切换（如 gitee 免费额度耗尽 → 切 jina）。
+- gitee Qwen3-Embedding (OpenAI-compatible; instruction on the query side)
+- jina-embeddings-v5-omni-small (REST API, task=retrieval.query, 1024 dims)
+Both produce the same dimensionality, so they swap seamlessly (e.g. gitee free quota exhausted → jina).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class Embedder:
         self._openai_client = None
         if provider == "jina":
             self._jina_client = requests.Session()
-        else:  # openai 兼容
+        else:  # openai-compatible
             self._openai_client = OpenAI(
                 base_url=base_url, api_key=api_key,
                 default_headers={"X-Failover-Enabled": "true"}, timeout=120)
@@ -68,7 +68,7 @@ class Embedder:
             r.raise_for_status()
             data = r.json()
             return [d["embedding"] for d in data["data"]]
-        # openai 兼容（gitee）
+        # openai-compatible (gitee)
         inputs = [
             f"{self._instruction}{t}" if (query and self._instruction) else t
             for t in texts
@@ -85,7 +85,7 @@ class Embedder:
 
 
 class Reranker:
-    """jina rerank：对候选文档按查询相关性重排（混合检索 v2 用）。"""
+    """jina rerank: reorders candidates by query relevance (hybrid v2)."""
 
     def __init__(self, base_url: str, api_key: str, model: str):
         self._url = base_url

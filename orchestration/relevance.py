@@ -1,12 +1,12 @@
-"""orchestration/relevance.py：相关性/意图校验层（阶段 3-2，堵 LLM 编造出口）。
+"""orchestration/relevance.py：relevance / intent check (stage 3-2, blocks the LLM fabrication path).
 
-问题：LLM 对超出 DSL 能力的问题不诚实降级，而可能编造：
-1. **hallucination**（幻觉编造）：问题含 DSL 不支持的实体（订单号 o_、状态、物流明细），
-   LLM 编造无关聚合查询（如订单状态题 → 渠道 CPS 订单数）。→ 拦截降级，不给错答案。
-2. **granularity**（粒度错位）：问题要求分组/过滤（各省份 GMV、按品类、XX 城市），
-   LLM 忽略限定词输出总聚合（各省份 GMV → 总 GMV）。→ 拦截后回灌修复（补维度/过滤）。
+Problem: for questions beyond the DSL, the LLM doesn't honestly degrade but fabricates:
+1. hallucination: question mentions DSL-unsupported entities (order id o_, status, logistics) and the LLM
+   fabricates an unrelated aggregate (order-status question → channel CPS order count). → block and degrade.
+2. granularity: question asks for grouping/filtering (per-province GMV, per-category, city X) but the LLM
+   ignores the qualifier and outputs a total aggregate. → block, feed back to repair (add dim/filter).
 
-本层纯函数、确定性、零 LLM。判断依据是「问题意图词」与「生成的语义查询结构」的对照。
+Pure, deterministic, zero LLM. Judges on the question's intent words vs the generated query structure.
 """
 
 from __future__ import annotations
@@ -17,22 +17,22 @@ from typing import Literal
 
 MismatchKind = Literal["hallucination", "granularity", "none"]
 
-# DSL 不支持的实体词（订单号/状态/物流等 → 幻觉编造，不可修）
+# DSL-unsupported entity words (order id / status / logistics → hallucination, unfixable)
 OUT_OF_DSL_PATTERNS = [
-    re.compile(r"\bo_\d{8}\b"),          # 订单号 o_00041423
+    re.compile(r"\bo_\d{8}\b"),          # order id like o_00041423
     re.compile(r"订单状态|支付状态|物流|是否完成|已退款|已发货|已支付|已完成"),
     re.compile(r"状态分布|按状态|状态是|状态的"),
     re.compile(r"订单明细|商品明细|每笔|逐笔|清单"),
 ]
 
-# 语义层不存在的维度词（reflect 也修不动 → 直接降级，省无效 LLM 调用）
-# 注意：只用精确双字词，避免单字「市/省/区/县」误伤「城市」（city_tier 是支持维度）
+# dimension words absent from the semantic layer (reflect can't fix → degrade directly)
+# note: exact two+ char words only, so single-char 市/省/区/县 don't false-hit 城市 (supported dim)
 UNSUPPORTED_DIM_WORDS = [
     "省份", "性别", "价格带", "年龄段", "支付方式", "支付渠道", "尺码",
     "品牌", "仓库", "快递", "优惠券", "会员等级", "门店", "店铺", "销售员", "平台",
 ]
 
-# 粒度错位：问题要求分组/过滤，但生成的查询无维度/过滤
+# granularity mismatch: question asks grouping/filtering but the query has no dimension/filter
 GRANULARITY_PATTERNS = [
     re.compile(r"各[省份省市县城区品牌年龄段性别价格带仓库尺码品类频道渠道城类型]"),  # 各省/各品牌/各渠道类型
     re.compile(r"按[^，。？?]{1,8}(维度|分组|分类|统计|计算|看)"),
@@ -42,7 +42,7 @@ GRANULARITY_PATTERNS = [
     re.compile(r"哪些|分别|对比|top\s*\d+|最高|最低"),
 ]
 
-# DSL 支持的聚合指标
+# DSL-supported aggregate metrics
 SUPPORTED_METRICS = {
     "gmv", "net_sales_amount", "orders_count", "avg_order_value",
     "refund_amount", "refund_rate", "repurchase_rate", "marketing_roi",
@@ -69,10 +69,10 @@ def _first_match(patterns: list, text: str) -> tuple[re.Pattern | None, str]:
 def check_relevance(question: str, metric: str | None,
                     dimensions: list | None = None,
                     filters: list | None = None) -> RelevanceVerdict:
-    """校验问题与语义查询是否相关。
+    """Check whether the question and the generated query are consistent.
 
-    question：改写后的问题；metric：指标名；dimensions/filters：查询的维度/过滤。
-    优先级：DSL 外实体 → hallucination；分组/过滤意图但查询无对应 → granularity。
+    Priority: DSL-unsupported entity → hallucination; grouping/filtering intent without matching
+    dimensions/filters → granularity.
     """
     pat, matched = _first_match(OUT_OF_DSL_PATTERNS, question)
     if pat is not None:
@@ -83,14 +83,14 @@ def check_relevance(question: str, metric: str | None,
                 pat.pattern)
         return RelevanceVerdict("none", "指标非聚合指标，交由编译错误处理")
 
-    # 语义层不存在的维度词 → 不可修，直接降级（省 reflect 无效调用）
+    # dimension word absent from the semantic layer → unfixable, degrade (skip futile reflect)
     for w in UNSUPPORTED_DIM_WORDS:
         if w in question:
             return RelevanceVerdict(
                 "hallucination",
                 f"问题要求不存在的维度「{w}」（语义层不支持，不可修复）")
 
-    # 粒度错位：有分组/过滤意图但查询无任何维度/过滤
+    # granularity mismatch: grouping/filtering intent but no dimensions/filters in the query
     gpat, gmatched = _first_match(GRANULARITY_PATTERNS, question)
     has_dim = bool(dimensions) or bool(filters)
     if gpat is not None and not has_dim and metric in SUPPORTED_METRICS:

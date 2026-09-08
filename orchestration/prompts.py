@@ -1,7 +1,7 @@
-"""orchestration/prompts.py：语义查询生成提示词（阶段二）。
+"""orchestration/prompts.py：semantic-query generation prompt.
 
-把自然语言问题映射为受约束的语义查询 JSON（指标 + 月窗口 + 可选维度/过滤），
-附 11 指标口径、维度值字典与 few-shot；绝不输出 SQL。
+Maps a natural-language question to a constrained semantic-query JSON (metric + window +
+optional dimensions/filters), citing semantic-layer metrics and value dictionaries; never emits SQL.
 """
 
 from __future__ import annotations
@@ -20,14 +20,6 @@ def _metric_block(layer: SemanticLayer) -> str:
     return "\n".join(lines)
 
 
-def _dim_block(layer: SemanticLayer) -> str:
-    lines = []
-    for name, d in layer.dimensions.items():
-        vals = " / ".join(str(v) for v in d["values"])
-        lines.append(f"- {name}（{d['display_name']}）：可选值 {vals}")
-    return "\n".join(lines)
-
-
 def _dsl_schema(today: str) -> str:
     return (
         '{"metric": "<指标名>", "window": {"type": "month", "value": "YYYY-MM"},'
@@ -42,6 +34,21 @@ def _yesterday(today: str) -> str:
     from datetime import date, timedelta
 
     return (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+
+
+def render_history(history: list[dict] | None, limit: int = 6) -> str:
+    """Render recent Q&A as a conversation-context block (for referent resolution)."""
+    if not history:
+        return ""
+    lines = []
+    for h in history[-limit:]:
+        q = h.get("question", "") if isinstance(h, dict) else ""
+        a = h.get("answer", "") if isinstance(h, dict) else ""
+        if q:
+            lines.append(f"用户：{q}")
+        if a:
+            lines.append(f"助手：{a[:400]}")
+    return "\n".join(lines)
 
 
 FEW_SHOT: list[tuple[str, dict]] = [
@@ -76,7 +83,7 @@ FEW_SHOT: list[tuple[str, dict]] = [
 
 
 def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> str:
-    # 动态填充「昨天」示例的日期（基于参考日 today）
+    # dynamically fill the "yesterday" few-shot date from the reference day
     yesterday = _yesterday(today)
     few_shot = "\n\n".join(
         f"问：{q}\n答：{json.dumps(sq, ensure_ascii=False).replace('__YESTERDAY__', yesterday)}"
@@ -88,7 +95,7 @@ def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> s
 {_metric_block(layer)}
 
 # 可用维度（含值字典，过滤值必须取自此清单）
-{_dim_block(layer)}
+{layer.format_dimensions()}
 
 # 相关表结构（已由检索层动态注入，Token 预算裁剪后）
 {schema_text}
