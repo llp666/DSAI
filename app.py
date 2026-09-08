@@ -302,39 +302,50 @@ def render_chart(result: dict) -> None:
 
 
 def _render_stream(chunks):
-    """Consume tagged (reasoning, content) chunks → (answer_text, reasoning_text).
+    """Consume tagged (phase, reasoning, content) chunks → (answer_text, reasoning_text).
 
-    Kimi-style: the model's chain-of-thought streams into a collapsible 「思考过程」
-    panel that sits ABOVE the answer. The panel is a running st.status while thinking
-    (spinner + pulsing header keep it alive across the thinking→answer gap), then
-    collapses to a static ✓ once the answer arrives. Both streams render with a gentle
-    typewriter cadence so they don't dump at once.
+    One live st.status panel carries the whole journey so there's no dead gap between
+    retrieval and thinking: it opens running at t=0, its label morphs as real pipeline
+    stages stream in (理解问题 → 检索数据表 → 生成查询), slides to 「Thinking…」 the moment
+    chain-of-thought starts, and collapses to a static ✓ once the answer arrives (or to a
+    neutral label when the reply had no thinking at all, e.g. casual chat). Both streams
+    render with a gentle typewriter cadence so they don't dump at once.
     """
-    status = st.empty()
-    status.caption("正在检索相关数据表…")
-    think = None          # st.status container (lazy)
-    think_box = None      # placeholder inside it (streams reasoning)
+    think = st.status("🔍 正在理解问题…", expanded=True)  # live from t=0 (spinner + pulsing header)
+    think_box = think.empty()
     think_text = ""
+    saw_reasoning = False
     answer = None         # lazy placeholder, created AFTER the thinking panel
     answer_text = ""
-    for kind, chunk in chunks:
-        if kind == "reasoning":
-            if think is None:
-                status.empty()
-                think = st.status("💭 正在思考…", expanded=True)
-                think_box = think.empty()
-            think_text += chunk
-            think_box.markdown(think_text)
-            time.sleep(0.006)  # gentle cadence: smooth reveal, not a sudden dump
-        elif kind == "content":
-            if think is not None:
-                think.update(label="💭 思考过程", state="complete", expanded=False)
-            if answer is None:
-                status.empty()
-                answer = st.empty()
-            answer_text += chunk
-            answer.markdown(answer_text)
-            time.sleep(0.004)
+    try:
+        for kind, chunk in chunks:
+            if kind == "phase":
+                if not saw_reasoning:  # keep 「Thinking…」 sticky once thinking has started
+                    think.update(label=f"🔍 {chunk}")
+            elif kind == "reasoning":
+                if not saw_reasoning:
+                    think.update(label="💭 Thinking…", expanded=True)
+                    saw_reasoning = True
+                think_text += chunk
+                think_box.markdown(think_text)
+                time.sleep(0.006)  # gentle cadence: smooth reveal, not a sudden dump
+            elif kind == "content":
+                if think is not None:
+                    if saw_reasoning:
+                        think.update(label="💭 Thinking", state="complete", expanded=False)
+                    else:
+                        think.update(label="💡 回答完成", state="complete", expanded=False)
+                if answer is None:
+                    answer = st.empty()
+                answer_text += chunk
+                answer.markdown(answer_text)
+                time.sleep(0.004)
+    finally:
+        # stream ended without ever producing content (error / empty answer): don't leave a
+        # dead spinner — collapse whatever the panel is showing.
+        if think is not None and answer is None:
+            think.update(label="💭 Thinking" if saw_reasoning else "💡 回答完成",
+                         state="complete", expanded=False)
     return answer_text, think_text
 
 
@@ -443,7 +454,7 @@ def main() -> None:
         with st.chat_message(m["role"], avatar=AVATARS[m["role"]]):
             if m["role"] == "assistant" and m.get("reasoning"):
                 # thinking panel sits ABOVE the answer (Kimi-style)
-                with st.status("💭 思考过程", state="complete", expanded=False):
+                with st.status("💭 Thinking", state="complete", expanded=False):
                     st.markdown(m["reasoning"])
             st.markdown(m["content"])
             if m["role"] == "assistant" and m.get("result"):

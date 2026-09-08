@@ -39,6 +39,22 @@ from retrieval.vector_store import VectorStore
 # retrieval injection token budget (1/8 of agnes 128k maxInput, leaving room for instruction/answer)
 RETRIEVAL_BUDGET = 16000
 
+# Technical appendix markers inside the deterministic answer that belong in the audit trail,
+# not the chat bubble: 数据来源表 (source tables) + SQL 溯源 (SQL) + 已尝试 SQL (degrade trace).
+# They always come last in the rendered template, so the chat answer cuts off at the first hit.
+_TECH_APPENDIX_MARKERS = ("数据来源表：", "SQL 溯源：", "已尝试 SQL：")
+
+
+def _strip_technical_appendix(text: str) -> str:
+    """Cut the SQL / source-table appendix out of an answer for the chat bubble.
+
+    ``state["answer"]`` keeps the full template (口径 + 数据来源表 + SQL 溯源) for the eval /
+    audit trail; the chat UI only wants the human-readable head. No-op when no marker is present."""
+    hit = [i for i in (text.find(m) for m in _TECH_APPENDIX_MARKERS) if i >= 0]
+    if not hit:
+        return text
+    return text[: min(hit)].rstrip()
+
 
 class Pipeline:
     def __init__(self, cfg: Config | None = None):
@@ -179,12 +195,12 @@ class Pipeline:
     # ---------- main entry (stage 3: delegate to the LangGraph state machine) ----------
     def answer(self, question: str, *, use_alt: bool = False,
                thread_id: str | None = None, history: list[dict] | None = None,
-               on_reasoning=None) -> dict:
+               on_reasoning=None, on_phase=None) -> dict:
         if self._graph is None:
             self._graph = DsaiGraph(self)
         return self._graph.answer(question, use_alt=use_alt,
                                   thread_id=thread_id, history=history,
-                                  on_reasoning=on_reasoning)
+                                  on_reasoning=on_reasoning, on_phase=on_phase)
 
     def answer_stream(self, question: str, *, use_alt: bool = False,
                       thread_id: str | None = None,
@@ -196,7 +212,9 @@ class Pipeline:
         the final state-machine result when streaming ends; ``chunks`` is a generator of tagged
         chunks. The state machine runs in a background thread; its live chain-of-thought is
         pumped through a queue so the UI can render a collapsible thinking panel while the answer
-        is still being generated.
+        is still being generated. Phase markers ("phase", label) are emitted at each pipeline stage
+        (理解问题 → 检索数据表 → 生成查询 → 执行计算) so the panel transitions smoothly instead of
+        freezing during the retrieval wait.
         """
         if result_box is None:
             result_box = {}
@@ -205,11 +223,14 @@ class Pipeline:
         def _hook(chunk: str) -> None:
             q.put(("reasoning", chunk))
 
+        def _phase(label: str) -> None:
+            q.put(("phase", label))
+
         def _run() -> None:
             try:
                 result_box["result"] = self.answer(
                     question, use_alt=use_alt, thread_id=thread_id,
-                    history=history, on_reasoning=_hook)
+                    history=history, on_reasoning=_hook, on_phase=_phase)
             except Exception as e:  # surface errors as the final content chunk
                 result_box["error"] = e
             finally:
@@ -225,9 +246,10 @@ class Pipeline:
             if "error" in result_box:
                 yield "content", f"（出错了：{result_box['error']}）"
             else:
-                # typewriter: hand the final answer to the UI in small slices so it
-                # streams out smoothly instead of dumping all at once.
-                text = result_box["result"].get("answer", "")
+                # chat-visible answer: strip the SQL / source-table appendix (eval keeps the
+                # full text), then hand it to the UI in small slices so it streams out smoothly
+                # instead of dumping all at once.
+                text = _strip_technical_appendix(result_box["result"].get("answer", ""))
                 for i in range(0, len(text), 12):
                     yield "content", text[i:i + 12]
 

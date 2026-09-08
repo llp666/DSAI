@@ -389,6 +389,12 @@ class DsaiGraph:
             return upd, None, None
         return upd, tool_answer, sq
 
+    def _emit_phase(self, label: str) -> None:
+        """Fire a pipeline-stage label (no-op outside the chat streaming UI)."""
+        cb = getattr(self, "_on_phase", None)
+        if cb is not None:
+            cb(label)
+
     # ---------- nodes ----------
 
     def _span(self, name: str, **kw):
@@ -398,6 +404,7 @@ class DsaiGraph:
         return _NullCtx()
 
     def intent_node(self, state: AgentState) -> dict:
+        self._emit_phase("正在理解问题…")
         ref = date.fromisoformat(self.cfg.reference_date) if self.cfg.reference_date else date.today()
         q = rewrite(state["question"], ref)  # deterministic time completion
         # three-layer RAG rewrite: coreference (history) / synonym / intent — before retrieval
@@ -406,6 +413,7 @@ class DsaiGraph:
         return {"question": q, "intent": intent}
 
     def retrieve_node(self, state: AgentState) -> dict:
+        self._emit_phase("正在检索数据表…")
         with self._span("retrieve", output={"intent": state.get("intent")}):
             degraded = False
             tables = []
@@ -428,6 +436,9 @@ class DsaiGraph:
             }
 
     def generate_node(self, state: AgentState, config=None) -> dict:
+        # label the phase truthfully: a diagnostic-tool question runs a tool round, not a plain query
+        intent = route_tool_intent(state["question"])
+        self._emit_phase("正在调用诊断工具…" if (intent.hit or intent.needs_llm) else "正在生成查询…")
         # reflect already rewrote the query: pass through (no LLM override), straight to tools recompile
         if state.get("_reflect_fixed"):
             return {"execution_error": None, "_reflect_fixed": False}
@@ -439,7 +450,6 @@ class DsaiGraph:
             upd: dict = {}
             tool_answer: str | None = None
             sq: SemanticQuery | None = None
-            intent = route_tool_intent(state["question"])
             if intent.hit or intent.needs_llm:
                 upd, tool_answer, sq = self._run_tool_round(state, llm, config)
             if tool_answer is not None:
@@ -470,6 +480,7 @@ class DsaiGraph:
                     "_reasoning": reasoning}
 
     def tools_node(self, state: AgentState, config) -> dict:
+        self._emit_phase("正在执行计算…")
         with self._span("tools", input={"n_errors": len(state.get("errors", []))}):
             msgs = list(state.get("messages", []))
             start = len(msgs)
@@ -856,8 +867,9 @@ class DsaiGraph:
 
     def answer(self, question: str, *, use_alt: bool = False,
                thread_id: str | None = None, history: list[dict] | None = None,
-               on_reasoning=None) -> dict:
+               on_reasoning=None, on_phase=None) -> dict:
         today = self.cfg.reference_date or date.today().isoformat()
+        self._on_phase = on_phase  # per-question phase callback (chat streaming UI); None for eval/tests
         state: AgentState = {
             "question": question,
             "intent": "",
