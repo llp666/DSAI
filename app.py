@@ -1,8 +1,8 @@
-"""app.py：ChatGPT-style chat interface.
+"""app.py — Apple-style chat frontend for the e-commerce data agent.
 
-- sidebar: new-chat button + past-conversation list (conversation history)
-- main: chat bubbles + bottom input; business questions go to the state machine,
-  casual talk goes to a plain LLM conversation (see orchestration/dialogue.route_dialogue)
+Design: airy light canvas, frosted-glass sidebar, hairline borders,
+gradient blue bubbles, floating capsule composer, rise/fade micro-motion.
+Business logic (state machine / casual routing) is unchanged.
 """
 
 from __future__ import annotations
@@ -10,8 +10,262 @@ from __future__ import annotations
 import uuid
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="电商智能问数 Agent", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="电商智能问数 Agent",
+    page_icon="✦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+CSS = r"""
+<style>
+:root{
+  --bg:#fbfbfd; --ink:#1d1d1f; --ink-2:#6e6e73; --ink-3:#86868b;
+  --blue:#0071e3; --blue-2:#0a84ff;
+  --hairline:rgba(0,0,0,.08);
+  --shadow-card:0 1px 2px rgba(0,0,0,.04),0 18px 44px -18px rgba(0,0,0,.16);
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text",
+         "Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+html,body,[data-testid="stAppViewContainer"]{
+  font-family:var(--font); color:var(--ink); -webkit-font-smoothing:antialiased;
+}
+[data-testid="stAppViewContainer"]{
+  background-color:var(--bg);
+  background-image:
+    radial-gradient(720px 460px at 88% -8%, rgba(0,113,227,.07), transparent 60%),
+    radial-gradient(640px 520px at -12% 110%, rgba(122,92,255,.06), transparent 60%);
+}
+.block-container{max-width:860px; padding:2.6rem 1.25rem 9rem}
+[data-testid="stDecoration"],[data-testid="stToolbar"],#MainMenu,footer{display:none}
+[data-testid="stHeader"]{
+  background:rgba(251,251,253,.55);
+  backdrop-filter:blur(18px) saturate(170%);
+  -webkit-backdrop-filter:blur(18px) saturate(170%);
+}
+hr{border:none;border-top:1px solid var(--hairline)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:rgba(0,0,0,.16);border-radius:99px}
+::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.28)}
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+
+/* ---------- sidebar: frosted glass ---------- */
+[data-testid="stSidebar"]{
+  background:rgba(255,255,255,.7);
+  backdrop-filter:blur(24px) saturate(170%);
+  -webkit-backdrop-filter:blur(24px) saturate(170%);
+  border-right:1px solid var(--hairline);
+}
+.brand{font-size:1.05rem;font-weight:700;letter-spacing:-.01em;display:flex;
+  align-items:center;gap:.55rem;margin:.2rem 0 1rem}
+.brand-dot{width:12px;height:12px;border-radius:50%;
+  background:conic-gradient(from 180deg,#0a84ff,#7a5cff,#ff375f,#0a84ff);
+  box-shadow:0 0 12px rgba(10,132,255,.55)}
+.side-label{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:600;margin:1rem .2rem .4rem}
+[data-testid="stSidebar"] .stButton button{
+  width:100%;border:none;background:transparent;color:var(--ink);
+  justify-content:flex-start;text-align:left;border-radius:14px;
+  padding:.6rem .8rem;font-weight:500;transition:all .22s var(--ease);
+}
+[data-testid="stSidebar"] .stButton button p{
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+}
+[data-testid="stSidebar"] .stButton button:hover{background:rgba(0,0,0,.05);transform:translateX(2px)}
+[data-testid="stSidebar"] .stButton button:active{transform:scale(.98)}
+[data-testid="stSidebar"] .stButton button:disabled{
+  opacity:1;cursor:default;color:var(--blue)!important;
+  background:rgba(0,113,227,.10);font-weight:600;
+}
+.st-key-new_chat button{
+  background:linear-gradient(120deg,#0a84ff,#0060df)!important;color:#fff!important;
+  font-weight:600!important;justify-content:center!important;
+  box-shadow:0 10px 24px -10px rgba(0,113,227,.6);
+}
+.st-key-new_chat button:hover{filter:brightness(1.07);transform:translateY(-1px)!important}
+
+/* ---------- hero (empty state) ---------- */
+.hero{text-align:center;padding:3.4rem 0 2.2rem;animation:fade .6s var(--ease) both}
+.hero-chip{display:inline-flex;align-items:center;gap:.4rem;font-size:.8rem;font-weight:600;
+  color:var(--ink-2);background:rgba(255,255,255,.85);border:1px solid var(--hairline);
+  border-radius:999px;padding:.35rem .85rem}
+.hero-title{font-size:clamp(2.4rem,6vw,3.6rem);line-height:1.1;font-weight:700;
+  letter-spacing:-.02em;margin:1.1rem 0 .8rem}
+.grad{background:linear-gradient(92deg,#0071e3 0%,#7a5cff 45%,#ff375f 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.hero-sub{color:var(--ink-2);font-size:1.05rem;max-width:32rem;margin:0 auto}
+
+/* suggestion cards */
+.st-key-sugg_0 button,.st-key-sugg_1 button,.st-key-sugg_2 button,.st-key-sugg_3 button{
+  min-height:60px;white-space:pre-wrap;text-align:left;justify-content:flex-start;
+  background:rgba(255,255,255,.92);border:1px solid var(--hairline);border-radius:18px;
+  padding:.85rem 1rem;font-weight:600;color:var(--ink);
+  box-shadow:0 1px 2px rgba(0,0,0,.03);
+  transition:transform .25s var(--ease),box-shadow .25s var(--ease),border-color .25s;
+}
+.st-key-sugg_0 button:hover,.st-key-sugg_1 button:hover,
+.st-key-sugg_2 button:hover,.st-key-sugg_3 button:hover{
+  transform:translateY(-3px);border-color:rgba(0,113,227,.35);box-shadow:var(--shadow-card);
+}
+
+/* ---------- chat rows ---------- */
+[data-testid="stChatMessage"]{animation:rise .45s var(--ease) both;background:transparent;padding:.35rem 0}
+[data-testid="stChatMessageContent"]{padding:.85rem 1.15rem;border-radius:20px;line-height:1.65}
+[data-testid="stMarkdownContainer"] p{margin-bottom:.35rem}
+
+/* avatars: glyph hidden, redrawn via CSS */
+[data-testid^="chatAvatarIcon"]{
+  width:34px;height:34px;min-width:34px;border-radius:12px;font-size:0;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 16px -8px rgba(0,0,0,.35);
+}
+[data-testid="chatAvatarIcon-assistant"]{background:#1d1d1f}
+[data-testid="chatAvatarIcon-assistant"]::after{content:"\2726";font-size:15px;color:#7cb3ff}
+[data-testid="chatAvatarIcon-user"]{background:linear-gradient(135deg,#0a84ff,#7a5cff)}
+[data-testid="chatAvatarIcon-user"]::after{
+  content:"";width:16px;height:16px;background:#fff;
+  -webkit-mask:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4.2"/><path d="M4 20c1.2-4 4.2-6 8-6s6.8 2 8 6z"/></svg>') center/contain no-repeat;
+  mask:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4.2"/><path d="M4 20c1.2-4 4.2-6 8-6s6.8 2 8 6z"/></svg>') center/contain no-repeat;
+}
+
+/* user bubble (right, blue gradient) */
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]){flex-direction:row-reverse}
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stChatMessageContent"]{
+  width:fit-content;max-width:78%;margin-left:auto;
+  background:linear-gradient(135deg,#0a84ff,#0068d8);color:#fff;
+  border-radius:20px 20px 8px 20px;
+  box-shadow:0 10px 26px -12px rgba(0,104,216,.55);
+}
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stMarkdownContainer"] p{color:#fff}
+
+/* assistant card (left, white) */
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stChatMessageContent"]{
+  width:fit-content;max-width:92%;background:#fff;
+  border:1px solid var(--hairline);border-radius:20px 20px 20px 8px;
+  box-shadow:var(--shadow-card);
+}
+
+/* plotly chart card */
+[data-testid="stPlotlyChart"]{
+  border:1px solid var(--hairline);border-radius:16px;overflow:hidden;
+  background:#fff;box-shadow:0 10px 30px -18px rgba(0,0,0,.2);padding:6px;margin-top:.4rem;
+}
+[data-testid="stSpinner"]{color:var(--ink-2)}
+
+/* ---------- composer: floating capsule ---------- */
+
+[data-testid="stBottom"],
+[data-testid="stBottomBlockContainer"] {
+  background: linear-gradient(180deg, rgba(251,251,253,0) 0%, var(--bg) 40%);
+}
+[data-testid="stBottom"] > div,
+[data-testid="stBottomBlockContainer"] > div {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* 去掉外层灰框 */
+[data-testid="stChatInput"] {
+  position: relative !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+/* 唯一可见容器：白色胶囊 */
+[data-testid="stChatInput"] > div {
+  position: relative !important;
+  background: rgba(255, 255, 255, 0.92) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline) !important;
+  border-radius: 999px !important;
+  box-shadow: 0 14px 40px -14px rgba(0, 0, 0, 0.22);
+  min-height: 52px !important;
+  display: flex !important;
+  align-items: center !important;
+  transition: box-shadow 0.25s var(--ease), border-color 0.25s var(--ease);
+}
+[data-testid="stChatInput"] > div:focus-within {
+  border-color: rgba(10, 132, 255, 0.55) !important;
+  box-shadow:
+    0 0 0 4px rgba(10, 132, 255, 0.16),
+    0 18px 44px -16px rgba(0, 0, 0, 0.24) !important;
+}
+
+[data-testid="stChatInput"] textarea {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 999px !important;
+  min-height: 52px !important;
+  padding: 14px 56px 14px 22px !important;
+  font-size: 1rem !important;
+  line-height: 1.4 !important;
+}
+[data-testid="stChatInput"] textarea:focus {
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+/* 箭头：与胶囊同高，贴右侧内缘 */
+button[data-testid="stChatInputSubmitButton"] {
+  position: absolute !important;
+  right: 18px !important;
+  top: 50% !important;
+  bottom: auto !important;
+  transform: translateY(-50%) !important;
+
+  width: 44px !important;
+  height: 44px !important;
+  min-width: 44px !important;
+  min-height: 44px !important;
+  max-height: 44px !important;
+
+  background: linear-gradient(135deg, #0a84ff, #0060df) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: 50% !important;
+  box-shadow: 0 4px 12px -2px rgba(0, 113, 227, 0.45);
+  z-index: 2;
+  transition: transform 0.2s var(--ease), filter 0.2s, opacity 0.2s;
+}
+button[data-testid="stChatInputSubmitButton"]:hover {
+  transform: translateY(-50%) scale(1.06) !important;
+  filter: brightness(1.05);
+}
+button[data-testid="stChatInputSubmitButton"]:disabled {
+  opacity: 0.4;
+  filter: grayscale(0.15);
+}
+
+/* 按钮内图标居中 */
+button[data-testid="stChatInputSubmitButton"] svg {
+  width: 18px !important;
+  height: 18px !important;
+}
+
+[data-testid="stIFrame"]{display:none}
+</style>
+"""
+
+st.markdown(CSS, unsafe_allow_html=True)
+
+AVATARS = {"user": "🧑", "assistant": "✨"}
+
+SUGGESTIONS = [
+    ("📈", "2026年7月的 GMV 是多少？"),
+    ("🏆", "上个月销量 Top 10 的商品"),
+    ("📦", "哪些商品有库存积压风险？"),
+    ("🧭", "你都能帮我做什么？"),
+]
 
 
 @st.cache_resource
@@ -48,67 +302,140 @@ def _conversation_history(messages: list[dict]) -> list[dict]:
     return history
 
 
+def _select(conv_id: str) -> None:
+    st.session_state.current = conv_id
+    st.session_state._scroll = True
+
+
+def _new_chat() -> None:
+    st.session_state.current = None
+
+
+def _suggest(text: str) -> None:
+    st.session_state._suggested = text
+
+
+def scroll_bottom() -> None:
+    components.html(
+        """
+        <script>
+        (function () {
+          var doc = window.parent.document;
+          ['[data-testid="stAppViewContainer"]', '.main', 'section.main'].forEach(function (s) {
+            var el = doc.querySelector(s);
+            if (el) { el.scrollTo({top: el.scrollHeight, behavior: 'smooth'}); }
+          });
+          window.parent.scrollTo({top: doc.body.scrollHeight, behavior: 'smooth'});
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def main() -> None:
-    if "conversations" not in st.session_state:
-        st.session_state.conversations = {}
-    if "current" not in st.session_state:
-        st.session_state.current = None
+    ss = st.session_state
+    ss.setdefault("conversations", {})
+    ss.setdefault("current", None)
 
-    p = get_pipeline()
+    pipeline = get_pipeline()
+    suggested = ss.pop("_suggested", None)
 
-    # ---- sidebar: new chat + conversation history ----
+    # ---- sidebar: brand + new chat + history ----
     with st.sidebar:
-        st.markdown("## 电商智能问数 Agent")
-        if st.button("＋ 新建对话", use_container_width=True):
-            st.session_state.current = None
-            st.rerun()
-        st.divider()
-        for conv_id in reversed(list(st.session_state.conversations.keys())):
-            conv = st.session_state.conversations[conv_id]
-            if st.button(conv["title"][:24], key=conv_id, use_container_width=True):
-                st.session_state.current = conv_id
-                st.rerun()
+        st.markdown(
+            '<div class="brand"><span class="brand-dot"></span>电商智能问数</div>',
+            unsafe_allow_html=True,
+        )
+        st.button("＋ 新建对话", key="new_chat", use_container_width=True, on_click=_new_chat)
+        st.markdown('<div class="side-label">历史对话</div>', unsafe_allow_html=True)
+        if not ss.conversations:
+            st.caption("暂无历史对话")
+        for conv_id in reversed(list(ss.conversations.keys())):
+            conv = ss.conversations[conv_id]
+            st.button(
+                conv["title"][:24] or "新对话",
+                key=f"conv_{conv_id}",
+                use_container_width=True,
+                disabled=(conv_id == ss.current),
+                on_click=_select,
+                args=(conv_id,),
+            )
 
-    # ---- main chat area ----
-    conv = st.session_state.conversations.get(st.session_state.current)
+    conv = ss.conversations.get(ss.current)
     messages = conv["messages"] if conv else []
 
+    # ---- hero + suggestions (empty state) ----
+    if not messages and suggested is None:
+        st.markdown(
+            """
+            <div class="hero">
+              <div class="hero-chip">✦&nbsp;&nbsp;AI 数据问数助手</div>
+              <div class="hero-title">把业务数据，<br><span class="grad">聊给你听。</span></div>
+              <div class="hero-sub">GMV、销量、库存、趋势——用一句大白话提问，剩下的交给 Agent。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(2)
+        for i, (icon, text) in enumerate(SUGGESTIONS):
+            with cols[i % 2]:
+                st.button(
+                    f"{icon}  {text}",
+                    key=f"sugg_{i}",
+                    use_container_width=True,
+                    on_click=_suggest,
+                    args=(text,),
+                )
+
+    # ---- history ----
     for m in messages:
-        with st.chat_message(m["role"]):
+        with st.chat_message(m["role"], avatar=AVATARS[m["role"]]):
             st.markdown(m["content"])
             if m["role"] == "assistant" and m.get("result"):
                 render_chart(m["result"])
 
-    if question := st.chat_input("问我一件事，例如：2026年7月GMV是多少？"):
-        if st.session_state.current is None or st.session_state.current not in st.session_state.conversations:
+    if ss.pop("_scroll", None):
+        scroll_bottom()
+
+    # ---- composer ----
+    prompt = st.chat_input("问点什么，例如：2026年7月GMV是多少？") or suggested
+
+    if prompt:
+        if ss.current is None or ss.current not in ss.conversations:
             conv_id = uuid.uuid4().hex[:12]
-            st.session_state.conversations[conv_id] = {
-                "title": question[:20],
+            ss.conversations[conv_id] = {
+                "title": prompt[:20],
                 "thread_id": uuid.uuid4().hex[:12],
                 "messages": [],
             }
-            st.session_state.current = conv_id
-        conv = st.session_state.conversations[st.session_state.current]
-        history = _conversation_history(conv["messages"])
+            ss.current = conv_id
+        conv = ss.conversations[ss.current]
+        messages = conv["messages"]
 
-        conv["messages"].append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
+        history = _conversation_history(messages)
+        messages.append({"role": "user", "content": prompt})
 
-        with st.chat_message("assistant"):
-            result = {}
+        with st.chat_message("user", avatar=AVATARS["user"]):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant", avatar=AVATARS["assistant"]):
+            result: dict = {}
             try:
-                with st.spinner("Agent 处理中…"):
-                    result, chunks = p.chat_stream(
-                        question, history=history, thread_id=conv["thread_id"])
+                with st.spinner("Agent年思考中…"):
+                    result, chunks = pipeline.chat_stream(
+                        prompt, history=history, thread_id=conv["thread_id"]
+                    )
                 full = st.write_stream(chunks)
             except Exception as e:
                 full = f"（出错了：{e}）"
                 st.markdown(full)
                 result = {}
             render_chart(result)
-            conv["messages"].append(
-                {"role": "assistant", "content": full, "result": result})
+
+        messages.append({"role": "assistant", "content": full, "result": result})
+        ss._scroll = True
+        st.rerun()
 
 
 if __name__ == "__main__":
