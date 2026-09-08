@@ -162,10 +162,32 @@ hr{border:none;border-top:1px solid var(--hairline)}
   background:rgba(0,0,0,.02);box-shadow:none;margin:.3rem 0;
 }
 [data-testid="stExpander"] summary{font-size:.85rem;font-weight:600;color:var(--ink-2)}
+/* live thinking panel: the open header (icon + label) comes alive while the panel runs —
+   breathing opacity, a soft blue glow around the label, and (where supported) a light band
+   that sweeps across the letters. All stop once the panel completes (aria-expanded=false). */
 @keyframes thinkPulse{0%,100%{opacity:1}50%{opacity:.42}}
-/* live thinking panel: the open header (icon + label) blinks until the panel completes */
+@keyframes thinkGlow{
+  0%,100%{text-shadow:0 0 0 transparent}
+  50%{text-shadow:0 0 10px rgba(10,132,255,.65),0 0 22px rgba(10,132,255,.35)}
+}
 [data-testid="stExpander"] summary[aria-expanded="true"]{
-  animation:thinkPulse 1.35s ease-in-out infinite;
+  animation:thinkPulse 1.35s ease-in-out infinite, thinkGlow 1.8s ease-in-out infinite;
+}
+@keyframes thinkShimmer{
+  0%,100%{background-position:0% 0}
+  50%{background-position:100% 0}
+}
+/* progressive: a light band sweeps across the label text. Guarded so the label can never be
+   rendered invisible — the 300% gradient always covers the text, and without background-clip
+   support the glow+pulse above are the whole effect. */
+@supports (-webkit-background-clip: text){
+  [data-testid="stExpander"] summary[aria-expanded="true"]{
+    background-image:linear-gradient(100deg,currentColor 0%,currentColor 35%,#7cb3ff 48%,#0a84ff 50%,#7cb3ff 52%,currentColor 65%,currentColor 100%);
+    background-size:300% 100%;
+    -webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;
+    animation:thinkShimmer 2.6s ease-in-out infinite, thinkPulse 1.35s ease-in-out infinite;
+  }
 }
 
 /* ---------- composer: floating capsule ---------- */
