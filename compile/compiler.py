@@ -158,6 +158,67 @@ def _build_part_cte(layer: SemanticLayer, name: str, part: dict,
     return f"p_{name} AS (SELECT {expr} AS {name} FROM {from_clause} WHERE {where})"
 
 
+def _needs_grouping(sq: SemanticQuery, dims: list[tuple[str, dict]]) -> bool:
+    """True when a dimension drill-down (not fully pinned by filters) needs GROUP BY.
+
+    「各品类GMV」→ dimensions without filter → grouped rows per category.
+    「服饰品类净销售额」→ dimension fully filtered → scalar, filter already applied in WHERE.
+    """
+    if not dims:
+        return False
+    filtered = {f.dim for f in sq.filters}
+    return any(name not in filtered for name, _ in dims)
+
+
+def _compile_grouped(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
+                     dims: list[tuple[str, dict]], fan_out: bool) -> str:
+    """Drill-down grouping: group every part by the dimension columns, combine per group.
+
+    e.g. 「各品类GMV」→ one row per category. Mirrors the rank path (parts aligned via
+    LEFT JOIN on the group key) without ordering/limit; item_grain dims switch parts to
+    item level (avoid 1:N fan-out double count); results sort by value DESC.
+    """
+    start, end = _bounds_for(sq.window.type, sq.window.value)
+    gk_cols = [f"{d['table']}.{d['column']}" for _, d in dims]
+    part_names = list(meta["parts"].keys())
+    dim_by_name = dict(dims)
+
+    ctes = []
+    for n in part_names:
+        part = meta["parts"][n]
+        expr = _part_expression(part, fan_out)
+        base = _part_base(layer, part, fan_out)
+        aliases = _collect_aliases(expr, part.get("time_column", ""),
+                                   *part.get("filters", []), *gk_cols)
+        required = set(aliases) | {base} | {d["table"] for _, d in dims}
+        required.discard(base)
+        chain = build_join_chain(layer.graph, base, required)
+        from_clause = _build_from(layer, base, chain)
+        conds = [f"({part['time_column']}::DATE BETWEEN DATE '{start}' AND DATE '{end}')"]
+        conds += [f"({filt})" for filt in part.get("filters", [])]
+        conds += [_dim_cond(dim_by_name[f.dim], f) for f in sq.filters if f.dim in dim_by_name]
+        where = " AND ".join(conds)
+        select_cols = ", ".join(gk_cols)
+        ctes.append(
+            f"p_{n} AS (SELECT {select_cols}, {expr} AS {n} FROM {from_clause} "
+            f"WHERE {where} GROUP BY {select_cols})")
+
+    qualified = _qualify_combine(meta["combine"], part_names)
+    rd = meta.get("round_digits", 2)
+    joins = f"p_{part_names[0]}"
+    for n in part_names[1:]:
+        joins += f" LEFT JOIN p_{n} ON " + " AND ".join(
+            f"p_{part_names[0]}.{d['column']} = p_{n}.{d['column']}" for _, d in dims)
+    select_dims = ", ".join(
+        f"p_{part_names[0]}.{d['column']} AS {d['column']}" for _, d in dims)
+    return (
+        f"WITH {', '.join(ctes)}\n"
+        f"SELECT {select_dims}, COALESCE(round(({qualified})::DOUBLE, {rd}), 0) AS result\n"
+        f"FROM {joins}\n"
+        f"ORDER BY result DESC"
+    )
+
+
 def _compile_parts(layer: SemanticLayer, sq: SemanticQuery, meta: dict,
                    dims: list[tuple[str, dict]], fan_out: bool) -> str:
     start, end = _bounds_for(sq.window.type, sq.window.value)
@@ -306,6 +367,8 @@ def _compile_query(sq: SemanticQuery, layer: SemanticLayer) -> str:
         sql = _compile_rank(layer, sq, meta, dims, fan_out)
     elif meta.get("kind") == "snapshot":
         sql = _compile_snapshot(layer, sq, meta, dims)
+    elif _needs_grouping(sq, dims):
+        sql = _compile_grouped(layer, sq, meta, dims, fan_out)
     else:
         sql = _compile_parts(layer, sq, meta, dims, fan_out)
 
