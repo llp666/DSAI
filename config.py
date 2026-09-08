@@ -51,6 +51,16 @@ class RerankConfig:
 
 
 @dataclass
+class SearchConfig:
+    """Web-search API (keenable — docs/model.md, stage-3 reserved extension).
+
+    Real-time questions (天气/新闻/最新…) are answered from live search results instead of
+    the agent refusing. POST {base_url}/search with X-API-Key returns [{title, url, snippet}]."""
+    base_url: str
+    api_key: str
+
+
+@dataclass
 class Config:
     llm: LLMConfig
     alt_llm: LLMConfig | None
@@ -65,6 +75,7 @@ class Config:
     embedding: EmbeddingConfig | None = None
     alt_embedding: EmbeddingConfig | None = None
     rerank: RerankConfig | None = None
+    search: SearchConfig | None = None
 
 
 def _llm_from_env(prefix: str) -> LLMConfig | None:
@@ -107,6 +118,10 @@ def load_config(env_path: str | Path | None = None) -> Config:
         api_key=os.environ.get("RERANK_API_KEY", ""),
         model=os.environ.get("RERANK_MODEL", ""),
     )
+    search = SearchConfig(
+        base_url=os.environ.get("SEARCH_BASE_URL", "https://api.keenable.ai/v1"),
+        api_key=os.environ.get("SEARCH_API_KEY", ""),
+    )
     return Config(
         llm=_llm_from_env("LLM"),
         alt_llm=_llm_from_env("ALT_LLM"),
@@ -123,6 +138,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         embedding=_embedding_from_env("EMBEDDING", "gitee"),
         alt_embedding=_embedding_from_env("ALT_EMBEDDING", "jina"),
         rerank=(rerank if rerank.api_key and rerank.model else None),
+        search=(search if search.api_key else None),
     )
 
 

@@ -33,8 +33,12 @@ class LLMClient:
         """Optional tool call: returns (content, tool_calls or None)."""
         raise NotImplementedError
 
-    def stream_complete(self, system: str, user: str):
-        """Stream a completion as tagged (kind, text) chunks: kind is 'reasoning' or 'content'."""
+    def stream_complete(self, system: str, user: str, *, no_thinking: bool = False):
+        """Stream a completion as tagged (kind, text) chunks: kind is 'reasoning' or 'content'.
+
+        ``no_thinking`` asks the provider to disable chain-of-thought (and drops any residual
+        reasoning chunks) — used for casual chat, where thinking only adds latency.
+        """
         raise NotImplementedError
 
     def complete_stream(self, system: str, user: str, *, on_reasoning=None) -> str:
@@ -62,15 +66,22 @@ class OpenAICompatClient(LLMClient):
         content, tool_calls = self._chat(system, user, tools=tools)
         return content, tool_calls
 
-    def stream_complete(self, system: str, user: str):
+    def stream_complete(self, system: str, user: str, *, no_thinking: bool = False):
         """Stream a completion as tagged (kind, text) chunks ('reasoning' then 'content').
 
         agnes-style models emit chain-of-thought in delta.reasoning_content before the
         answer; chunks yield ("reasoning", t) / ("content", t) so the UI can render a
-        Kimi-style collapsible thinking panel. 429 is retried only before streaming
+        Kimi-style collapsible thinking panel. ``no_thinking`` disables the provider's
+        thinking mode via chat_template_kwargs (docs/model.md) and skips any residual
+        reasoning chunks — used for casual chat, where chain-of-thought would only add
+        latency and risk leaking system-prompt echoes. 429 is retried only before streaming
         starts (mid-stream errors propagate).
         """
         last_exc: Exception | None = None
+        extra: dict = {}
+        if no_thinking:
+            # agnes: chat_template_kwargs toggles Thinking in OpenAI-compatible mode
+            extra["extra_body"] = {"chat_template_kwargs": {"thinking": {"type": "disabled"}}}
         for attempt in range(3):
             try:
                 stream = self._client.chat.completions.create(
@@ -82,6 +93,7 @@ class OpenAICompatClient(LLMClient):
                     temperature=self._cfg.temperature,
                     max_tokens=self._cfg.max_tokens,
                     stream=True,
+                    **extra,
                 )
                 buf: list[str] = []
                 reasoning_parts: list[str] = []
@@ -90,7 +102,7 @@ class OpenAICompatClient(LLMClient):
                     delta = chunk.choices[0].delta if chunk.choices else None
                     if delta:
                         r = getattr(delta, "reasoning_content", None)
-                        if r:
+                        if r and not no_thinking:
                             reasoning_parts.append(r)
                             yield "reasoning", r
                         if delta.content:

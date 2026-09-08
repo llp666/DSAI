@@ -37,6 +37,7 @@
 ```bash
 pip install -r requirements.txt
 cp .env.example .env            # 填入 LLM / EMBEDDING 密钥
+# 实时性问题（天气/新闻/汇率…）走网页搜索链路，可选：SEARCH_API_KEY=keen_xxx（见 docs/model.md）
 
 streamlit run app.py            # 启动前端
 python -m eval.run_demo         # 三场景 Demo（--tool-demo 工具四场景 / --empty-eval 空结果命中率）

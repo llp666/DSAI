@@ -162,32 +162,10 @@ hr{border:none;border-top:1px solid var(--hairline)}
   background:rgba(0,0,0,.02);box-shadow:none;margin:.3rem 0;
 }
 [data-testid="stExpander"] summary{font-size:.85rem;font-weight:600;color:var(--ink-2)}
-/* live thinking panel: the open header (icon + label) comes alive while the panel runs —
-   breathing opacity, a soft blue glow around the label, and (where supported) a light band
-   that sweeps across the letters. All stop once the panel completes (aria-expanded=false). */
 @keyframes thinkPulse{0%,100%{opacity:1}50%{opacity:.42}}
-@keyframes thinkGlow{
-  0%,100%{text-shadow:0 0 0 transparent}
-  50%{text-shadow:0 0 10px rgba(10,132,255,.65),0 0 22px rgba(10,132,255,.35)}
-}
+/* live thinking panel: the open header (icon + label) blinks until the panel completes */
 [data-testid="stExpander"] summary[aria-expanded="true"]{
-  animation:thinkPulse 1.35s ease-in-out infinite, thinkGlow 1.8s ease-in-out infinite;
-}
-@keyframes thinkShimmer{
-  0%,100%{background-position:0% 0}
-  50%{background-position:100% 0}
-}
-/* progressive: a light band sweeps across the label text. Guarded so the label can never be
-   rendered invisible — the 300% gradient always covers the text, and without background-clip
-   support the glow+pulse above are the whole effect. */
-@supports (-webkit-background-clip: text){
-  [data-testid="stExpander"] summary[aria-expanded="true"]{
-    background-image:linear-gradient(100deg,currentColor 0%,currentColor 35%,#7cb3ff 48%,#0a84ff 50%,#7cb3ff 52%,currentColor 65%,currentColor 100%);
-    background-size:300% 100%;
-    -webkit-background-clip:text;background-clip:text;
-    -webkit-text-fill-color:transparent;
-    animation:thinkShimmer 2.6s ease-in-out infinite, thinkPulse 1.35s ease-in-out infinite;
-  }
+  animation:thinkPulse 1.35s ease-in-out infinite;
 }
 
 /* ---------- composer: floating capsule ---------- */
@@ -326,48 +304,42 @@ def render_chart(result: dict) -> None:
 def _render_stream(chunks):
     """Consume tagged (phase, reasoning, content) chunks → (answer_text, reasoning_text).
 
-    One live st.status panel carries the whole journey so there's no dead gap between
-    retrieval and thinking: it opens running at t=0, its label morphs as real pipeline
-    stages stream in (理解问题 → 检索数据表 → 生成查询), slides to 「Thinking…」 the moment
-    chain-of-thought starts, and collapses to a static ✓ once the answer arrives (or to a
-    neutral label when the reply had no thinking at all, e.g. casual chat). Both streams
-    render with a gentle typewriter cadence so they don't dump at once.
+    Kimi-style: the model's chain-of-thought streams into a collapsible 「思考过程」
+    panel that sits ABOVE the answer. The panel is a running st.status while thinking
+    (spinner + pulsing header keep it alive across the thinking→answer gap), then
+    collapses to a static ✓ once the answer arrives. Both streams render with a gentle
+    typewriter cadence so they don't dump at once.
+
+    Pipeline-stage captions ("正在理解问题…" / "正在检索数据表…") come from ("phase", label)
+    chunks — business questions only. Casual chat yields content alone: no retrieval
+    caption, no thinking panel, the reply just streams straight out.
     """
-    think = st.status("🔍 正在理解问题…", expanded=True)  # live from t=0 (spinner + pulsing header)
-    think_box = think.empty()
+    status = st.empty()   # phase caption (lazy: business questions only)
+    think = None          # st.status container (lazy)
+    think_box = None      # placeholder inside it (streams reasoning)
     think_text = ""
-    saw_reasoning = False
     answer = None         # lazy placeholder, created AFTER the thinking panel
     answer_text = ""
-    try:
-        for kind, chunk in chunks:
-            if kind == "phase":
-                if not saw_reasoning:  # keep 「Thinking…」 sticky once thinking has started
-                    think.update(label=f"🔍 {chunk}")
-            elif kind == "reasoning":
-                if not saw_reasoning:
-                    think.update(label="💭 Thinking…", expanded=True)
-                    saw_reasoning = True
-                think_text += chunk
-                think_box.markdown(think_text)
-                time.sleep(0.006)  # gentle cadence: smooth reveal, not a sudden dump
-            elif kind == "content":
-                if think is not None:
-                    if saw_reasoning:
-                        think.update(label="💭 Thinking", state="complete", expanded=False)
-                    else:
-                        think.update(label="💡 回答完成", state="complete", expanded=False)
-                if answer is None:
-                    answer = st.empty()
-                answer_text += chunk
-                answer.markdown(answer_text)
-                time.sleep(0.004)
-    finally:
-        # stream ended without ever producing content (error / empty answer): don't leave a
-        # dead spinner — collapse whatever the panel is showing.
-        if think is not None and answer is None:
-            think.update(label="💭 Thinking" if saw_reasoning else "💡 回答完成",
-                         state="complete", expanded=False)
+    for kind, chunk in chunks:
+        if kind == "phase":
+            status.caption(chunk)
+        elif kind == "reasoning":
+            if think is None:
+                status.empty()
+                think = st.status("💭 Thinking…", expanded=True)
+                think_box = think.empty()
+            think_text += chunk
+            think_box.markdown(think_text)
+            time.sleep(0.006)  # gentle cadence: smooth reveal, not a sudden dump
+        elif kind == "content":
+            if think is not None:
+                think.update(label="💭 思考过程", state="complete", expanded=False)
+            if answer is None:
+                status.empty()
+                answer = st.empty()
+            answer_text += chunk
+            answer.markdown(answer_text)
+            time.sleep(0.004)
     return answer_text, think_text
 
 
