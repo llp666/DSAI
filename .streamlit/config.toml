@@ -1,0 +1,12 @@
+# Streamlit 运行配置（随仓库发布；secrets.toml 绝不入仓，见 .gitignore）
+
+[theme]
+# 应用自带一套浅色 Apple 风 CSS，固定浅色可以避免访客系统深色模式把对比度弄坏
+base = "light"
+primaryColor = "#0071e3"          # 与 app.py 的 --blue 对齐，原生控件的聚焦态同色
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

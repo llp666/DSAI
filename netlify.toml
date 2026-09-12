@@ -1,0 +1,5 @@
+# Netlify 部署配置：纯静态落地页，无构建步骤。
+# 站点源码在 site/；应用本体（Streamlit）不在这里，见 README。
+[build]
+  publish = "site"
+  # 没有构建命令：index.html / style.css / assets 都是手写的静态文件

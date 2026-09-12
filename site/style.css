@@ -1,0 +1,185 @@
+/* 落地页样式 —— 设计 token 与 app.py 的前端 CSS 保持一致（同一套视觉语言） */
+:root{
+  --bg:#fbfbfd; --ink:#1d1d1f; --ink-2:#6e6e73; --ink-3:#86868b;
+  --blue:#0071e3; --blue-2:#0a84ff; --violet:#7a5cff;
+  --green:#34C759; --red:#FF3B30; --orange:#FF9F0A;
+  --hairline:rgba(0,0,0,.08); --hairline-2:rgba(0,0,0,.06);
+  --card:#ffffff; --glass:rgba(255,255,255,.72);
+  --shadow-card:0 1px 2px rgba(0,0,0,.04),0 18px 44px -18px rgba(0,0,0,.16);
+  --shadow-soft:0 1px 2px rgba(0,0,0,.03),0 24px 60px -26px rgba(24,32,72,.22);
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text",
+         "Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --font-num:"SF Pro Rounded","SF Pro Display","DIN Alternate","Segoe UI Variable Display",
+         -apple-system,"Helvetica Neue",sans-serif;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+
+html{-webkit-text-size-adjust:100%}
+
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--font); font-size:17px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+  /* 顶部一层极淡的蓝紫光晕，和聊天页 hero 的处理一致 */
+  background-image:
+    radial-gradient(1100px 520px at 12% -8%, rgba(122,92,255,.10), transparent 60%),
+    radial-gradient(900px 460px at 88% -12%, rgba(10,132,255,.10), transparent 60%);
+  background-repeat:no-repeat;
+}
+
+.wrap{max-width:1080px; margin:0 auto; padding:0 24px}
+
+a{color:var(--blue); text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ── 顶栏 ─────────────────────────────────────────────── */
+.topbar{
+  position:sticky; top:0; z-index:10;
+  background:var(--glass); backdrop-filter:saturate(180%) blur(20px);
+  border-bottom:1px solid var(--hairline-2);
+}
+.topbar .wrap{display:flex; align-items:center; justify-content:space-between; height:52px}
+.brand{display:inline-flex; align-items:center; gap:9px; font-size:15px; font-weight:600; letter-spacing:-.01em}
+.brand .dot{width:9px; height:9px; border-radius:50%; background:linear-gradient(135deg,var(--blue-2),var(--violet))}
+.topbar-link{font-size:14px; color:var(--ink-2)}
+
+/* ── Hero ─────────────────────────────────────────────── */
+.hero{padding:84px 24px 40px; text-align:center}
+.eyebrow{
+  margin:0 0 18px; font-size:13px; font-weight:600; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--ink-3);
+}
+.hero h1{
+  margin:0 0 22px; font-size:clamp(30px,5.2vw,54px); line-height:1.16;
+  letter-spacing:-.022em; font-weight:700;
+  background:linear-gradient(180deg,#1d1d1f,#4a4a52);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.lede{
+  margin:0 auto; max-width:640px; font-size:clamp(16px,2vw,19px);
+  color:var(--ink-2); line-height:1.65;
+}
+.cta{display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin:32px 0 0}
+.btn{
+  display:inline-flex; align-items:center; justify-content:center;
+  height:46px; padding:0 24px; border-radius:999px;
+  font-size:16px; font-weight:600; letter-spacing:-.01em;
+  transition:transform .18s var(--ease), box-shadow .18s var(--ease), background .18s var(--ease);
+}
+.btn:hover{text-decoration:none; transform:translateY(-1px)}
+.btn-primary{background:var(--blue); color:#fff; box-shadow:0 8px 24px -10px rgba(0,113,227,.7)}
+.btn-primary:hover{background:#0077ed}
+.btn-ghost{background:#fff; color:var(--ink); border:1px solid var(--hairline); box-shadow:var(--shadow-card)}
+.btn-ghost:hover{background:#fff}
+
+/* ── 数字条 ───────────────────────────────────────────── */
+.stats{
+  list-style:none; margin:56px 0 0; padding:0;
+  display:grid; gap:1px; grid-template-columns:repeat(4,1fr);
+  background:var(--hairline-2); border:1px solid var(--hairline-2);
+  border-radius:20px; overflow:hidden; text-align:left;
+}
+.stats li{background:var(--card); padding:24px 22px}
+.stats b{
+  display:block; font-family:var(--font-num); font-size:clamp(22px,3vw,30px);
+  font-weight:700; letter-spacing:-.02em; color:var(--blue); margin-bottom:8px;
+}
+.stats span{display:block; font-size:13.5px; line-height:1.5; color:var(--ink-2)}
+
+/* ── 通用区块 ─────────────────────────────────────────── */
+.section{padding:76px 24px 0}
+.section h2{
+  margin:0 0 14px; font-size:clamp(24px,3.4vw,36px);
+  letter-spacing:-.02em; font-weight:700; line-height:1.25;
+}
+.section-lede{margin:0 0 36px; max-width:720px; color:var(--ink-2); font-size:17px}
+
+/* ── 问题 / 做法 ──────────────────────────────────────── */
+.pairs{display:grid; gap:16px; grid-template-columns:repeat(2,1fr)}
+.pair{
+  background:var(--card); border:1px solid var(--hairline-2); border-radius:20px;
+  padding:26px 26px 24px; box-shadow:var(--shadow-card);
+}
+.pair h3{margin:0 0 12px; font-size:19px; letter-spacing:-.015em}
+.pain{margin:0 0 16px; padding-left:14px; border-left:2px solid rgba(255,59,48,.35);
+      color:var(--ink-2); font-size:15px; line-height:1.6}
+.fix{margin:0; font-size:15px; line-height:1.65; color:var(--ink)}
+.tag{
+  display:inline-block; margin-right:8px; padding:2px 10px; border-radius:999px;
+  background:rgba(0,113,227,.09); color:var(--blue);
+  font-size:12.5px; font-weight:600; letter-spacing:.01em;
+}
+
+/* ── 流程 ─────────────────────────────────────────────── */
+.flow{
+  list-style:none; margin:0; padding:0;
+  display:flex; flex-wrap:wrap; gap:10px; align-items:stretch;
+}
+.flow li{
+  position:relative; flex:1 1 132px; min-width:132px;
+  background:var(--card); border:1px solid var(--hairline-2); border-radius:16px;
+  padding:16px 16px 15px; box-shadow:var(--shadow-card);
+}
+.flow li:not(:last-child)::after{
+  content:"→"; position:absolute; right:-16px; top:50%; transform:translateY(-50%);
+  color:var(--ink-3); font-size:13px;
+}
+.flow b{display:block; font-size:14.5px; letter-spacing:-.01em; margin-bottom:4px}
+.flow span{display:block; font-size:12.5px; line-height:1.45; color:var(--ink-2)}
+.flow .branch{background:linear-gradient(180deg,#fff,rgba(122,92,255,.06))}
+
+.principles{
+  margin:28px 0 0; padding:20px 24px; border-radius:16px;
+  background:rgba(0,113,227,.045); border:1px solid rgba(0,113,227,.10);
+  font-size:14.5px; line-height:1.7; color:var(--ink-2);
+}
+.principles b{display:block; margin-bottom:6px; color:var(--ink); font-size:14px}
+
+/* ── 亮点卡片 ─────────────────────────────────────────── */
+.grid{display:grid; gap:16px; grid-template-columns:repeat(4,1fr)}
+.card{
+  background:var(--card); border:1px solid var(--hairline-2); border-radius:20px;
+  padding:24px 22px; box-shadow:var(--shadow-card);
+  transition:transform .22s var(--ease), box-shadow .22s var(--ease);
+}
+.card:hover{transform:translateY(-3px); box-shadow:var(--shadow-soft)}
+.card h3{margin:0 0 10px; font-size:16.5px; letter-spacing:-.015em}
+.card p{margin:0; font-size:14.5px; line-height:1.62; color:var(--ink-2)}
+
+/* ── 截图 ─────────────────────────────────────────────── */
+.shot{margin:0 0 28px}
+.shot img{
+  width:100%; height:auto; display:block;
+  border:1px solid var(--hairline); border-radius:18px;
+  box-shadow:var(--shadow-soft); background:#fff;
+}
+.shot figcaption{margin-top:12px; font-size:14px; color:var(--ink-3); text-align:center}
+
+/* ── 页脚 ─────────────────────────────────────────────── */
+.foot{
+  margin-top:88px; padding:44px 0 60px;
+  border-top:1px solid var(--hairline-2); background:rgba(255,255,255,.6);
+}
+.foot p{margin:0 0 10px; font-size:14px; color:var(--ink-2)}
+.foot .stack{font-weight:600; color:var(--ink); letter-spacing:-.01em}
+.foot .note{max-width:680px; font-size:13.5px; line-height:1.65; color:var(--ink-3)}
+
+/* ── 响应式 ───────────────────────────────────────────── */
+@media (max-width:900px){
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .stats{grid-template-columns:repeat(2,1fr)}
+}
+@media (max-width:640px){
+  body{font-size:16px}
+  .hero{padding-top:56px}
+  .pairs,.grid{grid-template-columns:1fr}
+  .stats{grid-template-columns:1fr}
+  .flow li:not(:last-child)::after{content:"↓"; right:50%; top:auto; bottom:-19px; transform:translateX(50%)}
+  .flow li{flex:1 1 100%}
+}
+
+@media (prefers-reduced-motion:reduce){
+  *{transition:none !important}
+}

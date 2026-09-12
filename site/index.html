@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电商智能问数 Agent · DSAI</title>
+<meta name="description" content="把「业务提需求 → 分析师写 SQL → 回解读」的小时级链路，压缩成一次对话：自然语言 → 语义层 → 确定性 SQL → 口径可解释的洞察与图表。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <span class="brand"><span class="dot"></span>电商智能问数 Agent</span>
+    <a class="topbar-link" href="https://github.com/llp666/DSAI" target="_blank" rel="noopener">GitHub 源码</a>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── Hero ───────────────────────────────────────────────────── -->
+  <section class="hero wrap">
+    <p class="eyebrow">DSAI · Text-to-SQL Agent</p>
+    <h1>用一句话问数，<br>把小时级取数链路压成一次对话。</h1>
+    <p class="lede">
+      自然语言 → 语义层 → 确定性 SQL → 口径可解释的洞察与图表。
+      答案里带着口径、命中的表和可溯源的 SQL，而不是一个不知道从哪来的数字。
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/llp666/DSAI" target="_blank" rel="noopener">查看源码</a>
+      <!-- 想把在线演示公开时，把上面的 href 换成你的 Streamlit 地址并改文案为「在线体验」 -->
+      <a class="btn btn-ghost" href="https://github.com/llp666/DSAI#readme" target="_blank" rel="noopener">在线演示 · 按需开放</a>
+    </div>
+
+    <ul class="stats">
+      <li><b>20% → 100%</b><span>直写 SQL 基线 → 语义层 + 编译器<br>（33 问端到端，±1% 容差）</span></li>
+      <li><b>88.9%</b><span>检索 Recall@3<br>（30 问检索集，dev/holdout 防过拟合）</span></li>
+      <li><b>24/24</b><span>报错纠错错位处理率<br>含 17 例幻觉拦截不静默通过</span></li>
+      <li><b>5 层</b><span>数据与元数据 / 检索 / 编排<br>/ 语义编译执行 / 工具与呈现</span></li>
+    </ul>
+  </section>
+
+  <!-- ── 问题 ───────────────────────────────────────────────────── -->
+  <section class="wrap section">
+    <h2>Text-to-SQL 的真正难点不在模型，在四个结构性缺口</h2>
+    <p class="section-lede">
+      公开基准上执行准确率已经到 84.9%，但企业真实数仓里普遍掉到 10%~31%。
+      这四类问题各自对应本项目的一个模块。
+    </p>
+
+    <div class="pairs">
+      <article class="pair">
+        <h3>指标口径歧义</h3>
+        <p class="pain">「卖得最好」是销量件数还是净销售额？扣不扣退款？线上退货率约 19.3%，不扣退款会系统性高估近两成。</p>
+        <p class="fix"><span class="tag">语义层</span>净销售额、净利润、复购率、ROI 等口径固化为 YAML，LLM 只选指标与维度。</p>
+      </article>
+      <article class="pair">
+        <h3>表规模爆炸</h3>
+        <p class="pain">数百张表，全量 DDL 注入 4.2 万 Token（超预算 2.6 倍），还会干扰模型选表。</p>
+        <p class="fix"><span class="tag">混合检索</span>问题改写 + 向量/关键词 RRF 融合，Top-3 表与场景卡动态注入。</p>
+      </article>
+      <article class="pair">
+        <h3>报错与空结果</h3>
+        <p class="pain">0 行比报错更危险——用户看到的是一张空表，Agent 会自信地说「没有数据」。</p>
+        <p class="fix"><span class="tag">双轨纠错</span>报错走纠错轨（结构化回灌 Error Log），空结果走反思轨（日期边界/值域/粒度/时效）。</p>
+      </article>
+      <article class="pair">
+        <h3>只出数字不出诊断</h3>
+        <p class="pain">业务要的是「怎么办」，让 LLM 对着结果即兴发挥既不可控也不可复现。</p>
+        <p class="fix"><span class="tag">诊断工具链</span>库存断货/呆滞、营销 ROI 漏斗等经营规则以代码固化，输出 data / insights / chart。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 架构 ───────────────────────────────────────────────────── -->
+  <section class="wrap section">
+    <h2>一次提问的完整旅程</h2>
+    <p class="section-lede">
+      LLM 的职责被限定在「把自然语言映射为受约束的语义查询」——不写 SQL，口径由确定性代码保障。
+    </p>
+
+    <ol class="flow">
+      <li><b>提问</b><span>自然语言</span></li>
+      <li><b>检索</b><span>改写 + 混合检索 Top-3</span></li>
+      <li><b>语义查询</b><span>选指标 + 选维度</span></li>
+      <li><b>编译</b><span>确定性展开为 SQL</span></li>
+      <li><b>只读执行</b><span>DuckDB</span></li>
+      <li class="branch"><b>裁决</b><span>报错 → 纠错轨 / 空结果 → 反思轨</span></li>
+      <li><b>交付</b><span>数字 + 口径 + 溯源 + 图表</span></li>
+    </ol>
+
+    <p class="principles">
+      <b>四条设计原则</b>
+      语义先行（LLM 不写 SQL）· 检索先行（先定位表再生成）· 确定性优先（口径、JOIN、诊断规则、图表样式一律用代码固化）· 可解释可回溯（每次回答附口径说明、命中表与编译后的 SQL）
+    </p>
+  </section>
+
+  <!-- ── 亮点 ───────────────────────────────────────────────────── -->
+  <section class="wrap section">
+    <h2>功能亮点</h2>
+    <div class="grid">
+      <article class="card">
+        <h3>💬 一句话问数</h3>
+        <p>无需知道表名和字段名。问「上个月哪个商品卖得最好」，回答带口径说明——是按净销售额（已扣退款）排的。</p>
+      </article>
+      <article class="card">
+        <h3>📊 经营看板</h3>
+        <p>库存告警（断货/低库存/呆滞分桶 + DOI×环比象限图）、经营概览（7 项指标 + 环比 + 近 6 月趋势）、营销建议（渠道 ROI 对比）。图表支持 ▶ 播放动态回放。</p>
+      </article>
+      <article class="card">
+        <h3>📈 一句话生成图表</h3>
+        <p>在经营看板里直接提问，结果自动配图：标量指标出趋势折线，分组结果出分布柱状图，诊断工具出象限散点图。</p>
+      </article>
+      <article class="card">
+        <h3>🛠 出诊断，不只出数字</h3>
+        <p>「SKU 剩余可售 4.2 天、环比 +38%、建议 48 小时内补货」——附依据数字与 DOI 象限散点图，诊断规则是唯一事实源。</p>
+      </article>
+      <article class="card">
+        <h3>🧭 口径可解释</h3>
+        <p>每次回答附口径说明、命中的表与编译后的 SQL，可逐步复核 Agent 的每一次决策。</p>
+      </article>
+      <article class="card">
+        <h3>🧠 思考过程可见</h3>
+        <p>检索、生成、执行各阶段实时推送到思考面板，推理流式揭示，跑完自动收起。</p>
+      </article>
+      <article class="card">
+        <h3>🌐 实时问题联网</h3>
+        <p>天气、汇率、最新资讯这类问题由 LLM 自主决定调用联网搜索，带来源摘要回答——不硬塞进数据链路。</p>
+      </article>
+      <article class="card">
+        <h3>👋 闲聊直连</h3>
+        <p>问候、道谢零延迟回复；普通闲聊不检索、不动数仓。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 截图 ───────────────────────────────────────────────────── -->
+  <section class="wrap section">
+    <h2>界面</h2>
+    <figure class="shot">
+      <img src="assets/chat.jpg" alt="聊天问数与思考面板" loading="lazy">
+      <figcaption>聊天问数：思考过程实时揭示，回答带口径说明</figcaption>
+    </figure>
+    <figure class="shot">
+      <img src="assets/dashboard.jpg" alt="经营看板三张卡片" loading="lazy">
+      <figcaption>经营看板：库存告警 / 经营概览 / 营销建议</figcaption>
+    </figure>
+    <figure class="shot">
+      <img src="assets/chart.jpg" alt="一句话生成的图表" loading="lazy">
+      <figcaption>一句话生成图表：标量指标出趋势折线</figcaption>
+    </figure>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <p class="stack">LangGraph · ChromaDB · sqlglot · DuckDB · Pandas / Plotly · Streamlit · Langfuse</p>
+    <p class="note">
+      数仓为合成数据（规模、脏数据比例、随机种子均可配置），规避真实数据合规风险。
+      相对时间问法以固定基准日解析，因此演示结果可复现。
+    </p>
+    <p><a href="https://github.com/llp666/DSAI" target="_blank" rel="noopener">github.com/llp666/DSAI</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

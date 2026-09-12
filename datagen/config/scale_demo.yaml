@@ -1,0 +1,36 @@
+# 演示配置：给在线演示用的轻量数仓（Streamlit Community Cloud 冷启动自举）。
+#
+# 与 scale_full 的唯一差别是「行数」——日期区间、促销日、脏数据注入、演示埋点
+# 全部保持一致，这样相对时间问法（「上个月」「近 6 月趋势」）与看板、诊断工具
+# 的演示效果都与完整版一致，只是产物更小、生成更快（适配免费实例的 1GB 内存）。
+#
+# 校验要点：demo_cases 里的硬编码 SKU/渠道并不依赖具体行数——
+# 渠道缺失时 gen_channels 会补成额外渠道，库存埋点按「数据期销量排名」动态选 SKU。
+seed: 20260902
+date_range: {start: "2025-01-01", end: "2026-08-31"}
+users:      {count: 40000}
+products:   {sku: 1500, categories: 30}
+orders:     {count: 80000, avg_items: 2.0, paid_share: 0.30}
+seasonality: {dow: [1.15, 1.0, 0.95, 0.9, 0.95, 1.1, 1.25], noise_sigma: 0.15}
+promo_days:                       # 促销日及前后1天单量抬升
+  - {date: "2025-06-18", factor: 3.5}
+  - {date: "2025-11-11", factor: 5.0}
+  - {date: "2026-06-18", factor: 3.5}
+sku_zipf:   {exponent: 0.9}       # 销量长尾
+repeat_mix: {heavy_share: 0.35, heavy_weight: 2.5, light_weight: 0.3}
+refund:     {default: 0.12, apparel: 0.22, electronics: 0.12,
+             delay_lognormal: [2.0, 0.8], partial_range: [0.85, 1.0]}
+ads:        {channels: 8, cpm: [5, 50], ctr: [0.008, 0.05],
+             cvr: [0.015, 0.04], attribution: 0.8}
+supply:     {lead_days: [7, 14], reorder_coverage: 21}
+inventory:  {snapshot_grain: week}
+demo_cases:                       # 演示埋点（SPEC §5.5）
+  stockout_skus:       ["SKU-0077", "SKU-0141"]
+  dead_stock_skus:     ["SKU-0312", "SKU-0405"]
+  negative_roi_channels: ["channel_cps_03", "channel_sms_02"]
+dirty:
+  null_rate: 0.03
+  enum_drift: {rate: 0.015, partition: "2025-Q1", mapping: {"4": "已完成"}}
+  tz_shift:   {partition: "2025-Q1", hours: -8}
+  late_arrival: {rate: 0.02, tail_days: 3, tail_keep: 0.8}
+optional:   {traffic_events: true, search_logs: false}

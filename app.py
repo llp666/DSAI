@@ -13,7 +13,13 @@ import uuid
 
 import streamlit as st
 
+from bootstrap import bridge_secrets
 from tools import dashboard
+
+# 部署环境（Streamlit Community Cloud）把密钥放在 st.secrets，而 config.py 只读
+# os.environ/.env —— 这层桥接必须早于任何 load_config()。tools.dashboard / compile
+# 在 import 期都不读配置，所以放在这里足够早。本地无 secrets.toml 时是 no-op。
+bridge_secrets()
 
 st.set_page_config(
     page_title="电商智能问数 Agent",
@@ -628,6 +634,29 @@ def _render_typewriter() -> None:
     st.iframe(_TYPEWRITER_HTML, width="stretch", height=72)
 
 
+def _ensure_bootstrap() -> None:
+    """新环境首次启动：补齐数仓 / 表元数据 / 检索索引（详见 bootstrap 模块文档）。
+
+    产物齐备时是一次纯检查——本地开发与测试走的就是这条路，零开销。
+    刻意放在 main() 而不是 get_pipeline() 里：进度展示要用 st.status，
+    而 cache_resource 的函数体不适合做交互与 st.stop。
+    """
+    import bootstrap
+
+    if bootstrap.artifacts_ready():
+        return
+    with st.status("首次启动：正在生成演示数仓与检索索引…", expanded=True) as status:
+        ok = bootstrap.ensure_artifacts(progress=status.write)
+        status.update(label="初始化完成" if ok else "初始化失败",
+                      state="complete" if ok else "error", expanded=not ok)
+    if not ok:
+        st.error(
+            "初始化失败，请查看上方日志。常见原因：EMBEDDING_* 密钥缺失或网络不通"
+            "（构建向量索引需要调用嵌入 API）。本地可运行 `python bootstrap.py` 单独排查。"
+        )
+        st.stop()
+
+
 @st.cache_resource
 def get_pipeline():
     from orchestration.pipeline import Pipeline
@@ -1119,6 +1148,7 @@ def main() -> None:
     ss.setdefault("view_current", {"chat": None, "dashboard": None})
     ss.setdefault("_dash", {"mode": "default", "cards": None})
 
+    _ensure_bootstrap()
     pipeline = get_pipeline()
     if getattr(pipeline, "_dash_box", None) is None:
         pipeline._dash_box = {}                     # 后台预装配看板卡片 → 首次跳看板丝滑
