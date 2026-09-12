@@ -6,6 +6,8 @@
 本项目把「业务提需求 → 分析师写 SQL → 回解读」的小时级链路，压缩成一次对话——
 答案里带着口径、命中的表和可溯源的 SQL，而不是一个不知道从哪来的数字。
 
+🔗 **产品介绍页**：[dsagent.netlify.app](https://dsagent.netlify.app/)　·　在线演示按需提供
+
 ---
 
 ## 一、我们要解决的问题
@@ -81,6 +83,14 @@ streamlit run app.py                                             # 启动
 
 数仓数据由 `datagen/` 合成生成（规模、脏数据比例、随机种子均在 `datagen/config/` 配置），
 规避真实数据的合规风险，同时保留多数据域、多表关联与真实数仓的分布特征。
+
+### 部署
+
+仓库不携带任何数据产物：`warehouse/`（数仓 + 向量索引）与 `meta/`（表文档）都是 `datagen` 的生成物，
+已 gitignore。应用部署到 Streamlit Community Cloud 时，`bootstrap.py` 会在首次启动自动补齐——
+按 `datagen/config/scale_demo.yaml` 生成演示规模数仓，再构建检索索引（约 1~2 分钟，页面显示进度），
+密钥经 `bootstrap.bridge_secrets()` 从 `.streamlit/secrets.toml` 桥接为环境变量。
+产品介绍页部署在 Netlify，源码在 `site/`，配置见 `netlify.toml`。
 
 **技术栈**：LangGraph（有环状态机）· ChromaDB · sqlglot · DuckDB · Pandas / Plotly · Streamlit · Langfuse
 
