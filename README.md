@@ -23,25 +23,19 @@ streamlit run app.py                                             # 启动
 
 ## 目录结构
 
-按五层架构组织，层间以契约接口交互，任一层可替换而不动其他层——LLM 可换（适配层）、
-向量库可换（仓储接口）、数仓可换（连接器）。
-
 | 层 | 目录 | 职责 |
 |---|---|---|
-| L1 数据与元数据 | `data/` | 语义层 YAML（指标口径、关系、维度值域）、表文档与场景卡语料 |
-| L2 检索 | `retrieval/` | 问题改写、向量 + 关键词混合检索、Top-3 注入与 Token 预算裁剪 |
-| L3 编排 | `orchestration/` | LangGraph 状态机、意图解析、双轨纠错路由、三层熔断 |
-| L4 语义编译与执行 | `compile/` | 语义查询 DSL、sqlglot 编译器、干跑校验、只读执行 |
-| L5 工具与呈现 | `tools/` | 库存/营销诊断工具、看板与图表；`app.py` 是 Streamlit 前端入口 |
+| L1 数据与元数据 | `data/` | 语义层、检索语料 |
+| L2 检索 | `retrieval/` | 混合检索、Token 预算 |
+| L3 编排 | `orchestration/` | LangGraph 状态机、双轨纠错 |
+| L4 语义编译与执行 | `compile/` | 语义查询 → SQL → 只读执行 |
+| L5 工具与呈现 | `tools/` | 诊断工具、看板与图表 |
 
-`datagen/` 是模拟数仓生成器，只在准备数据时运行，不在提问链路上。
+`app.py` 为 Streamlit 入口；`datagen/` 生成模拟数仓。
 
 ## 部署
 
-仓库不携带数据产物：`warehouse/`（数仓 + 向量索引）与 `meta/`（表文档）都由 `datagen` 生成。
-部署到 Streamlit Community Cloud 时，`bootstrap.py` 会在首次启动自动补齐——按
-`datagen/config/scale_demo.yaml` 生成演示规模数仓，再构建检索索引（约 1~2 分钟，页面显示进度）；
-密钥经 `bootstrap.bridge_secrets()` 从 `.streamlit/secrets.toml` 桥接为环境变量
-（社区云的 `st.secrets` 不会进 `os.environ`）。产品介绍页部署在 Netlify，源码见 `site/`。
+数据产物（`warehouse/`、`meta/`）不入仓，均由 `datagen` 生成；部署到 Streamlit Community Cloud 时，
+`bootstrap.py` 在首次启动自动补齐（约 1~2 分钟）。介绍页在 Netlify，源码见 `site/`。
 
 **技术栈**：LangGraph · ChromaDB · sqlglot · DuckDB · Pandas / Plotly · Streamlit · Langfuse
