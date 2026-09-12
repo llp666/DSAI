@@ -40,13 +40,14 @@ from retrieval.vector_store import VectorStore
 RETRIEVAL_BUDGET = 16000
 
 # Technical appendix markers inside the deterministic answer that belong in the audit trail,
-# not the chat bubble: 数据来源表 (source tables) + SQL 溯源 (SQL) + 已尝试 SQL (degrade trace).
-# They always come last in the rendered template, so the chat answer cuts off at the first hit.
-_TECH_APPENDIX_MARKERS = ("数据来源表：", "SQL 溯源：", "已尝试 SQL：")
+# not the chat bubble: 口径 (metric caliber / retrieval rules, agent-facing) + 数据来源表
+# (source tables) + SQL 溯源 (SQL) + 已尝试 SQL (degrade trace). They always come last in the
+# rendered template, so the chat answer cuts off at the first hit.
+_TECH_APPENDIX_MARKERS = ("口径：", "数据来源表：", "SQL 溯源：", "已尝试 SQL：")
 
 
 def _strip_technical_appendix(text: str) -> str:
-    """Cut the SQL / source-table appendix out of an answer for the chat bubble.
+    """Cut the caliber / SQL / source-table appendix out of an answer for the chat bubble.
 
     ``state["answer"]`` keeps the full template (口径 + 数据来源表 + SQL 溯源) for the eval /
     audit trail; the chat UI only wants the human-readable head. No-op when no marker is present."""
@@ -65,6 +66,8 @@ _REASONING_FILTER_MARKERS = (
     # casual system prompt（对话规则块）
     "你是「电商智能问数 Agent」", "对话规则", "电商智能问数 Agent」自称",
     "友好、简洁地回答", "若用户提到数据或指标", "不编造任何数据",
+    # 推理语言约束行（思考过程（reasoning…）——防止该指令被模型 echo 进面板
+    "思考过程（reasoning", "用中文思考", "全程用中文",
     # 语义查询生成器 system prompt
     "语义查询生成器", "可用指标", "可用维度", "相关表结构", "输出格式",
     "只输出合法 JSON", "今天的日期", "few-shot",
@@ -141,7 +144,7 @@ class Pipeline:
                 emb.chroma_dir,
                 Embedder(emb.provider, emb.base_url, emb.api_key, emb.model,
                          emb.dimensions, emb.instruction, emb.task))
-            if self.cfg.rerank and self.cfg.rerank.api_key:
+            if self.cfg.rerank and self.cfg.rerank.api_key and self.cfg.rerank_enabled:
                 self._reranker = Reranker(self.cfg.rerank.base_url,
                                           self.cfg.rerank.api_key,
                                           self.cfg.rerank.model)
@@ -151,6 +154,18 @@ class Pipeline:
         self._answer_tpl = self._env.get_template("answer.j2")
         self._graph = None
         self._monitor: QuestionMonitor | None = None  # per-question budget (set at answer entry)
+
+    def warm_up(self) -> None:
+        """Best-effort background warm-up so the first question skips the HTTP handshake.
+
+        Measured: the first embedding of a process costs ~1970ms vs ~320ms warm — the whole
+        difference is DNS + TLS. Called once at app start (``app.get_pipeline``), deliberately
+        *not* from ``__init__`` so tests building a Pipeline directly don't spawn network threads.
+        """
+        if self._vector_store is None:
+            return
+        threading.Thread(target=self._vector_store.warm_up, daemon=True,
+                         name="pipeline-warmup").start()
 
     def _get_llm(self, use_alt: bool) -> LLMClient:
         if use_alt:
@@ -352,22 +367,52 @@ class Pipeline:
             yield "content", instant
             return
         yield "phase", "正在思考…"
+        # 语义层指标释义注入：概念题（什么是GMV/解释一下ROI）由 casual 链路回答时，
+        # 优先用本系统语义层的口径定义（口径已固化、权威），LLM 背景知识只作补充；
+        # 未知领域/实时热点仍由 LLM 自主决定调 search_tool 联网检索。
+        # getattr 降级：MagicMock/精简桩可能没有 layer —— 释义块置空，其余规则不变。
+        layer = getattr(self, "layer", None)
+        metric_digest = ""
+        if layer is not None:
+            metric_digest = "\n".join(
+                f"- {name}（{m['display_name']}）：{m['description']}"
+                for name, m in layer.metrics.items()
+            )
         system = (
             "你是「电商智能问数 Agent」，一个面向电商业务数据的智能问答助手，"
             "能帮用户查询 GMV、销售额、订单、库存等经营指标，也能联网查实时/资讯类问题。\n"
             "对话规则：\n"
             "- 始终以「电商智能问数 Agent」自称，绝不透露底层模型名称或厂商身份（如 agnes、OpenAI 等）。\n"
+            "- 思考过程（reasoning）与作答必须使用与用户提问相同的语言——用户用中文提问时必须全程用中文思考与拆解，绝不切换为英文。\n"
             "- 友好、简洁地回答问候、闲聊、自我介绍、功能帮助类问题。\n"
+            "- 解释概念/名词（如「什么是GMV」「ROI 是什么意思」）时，优先依据下方「本系统指标口径」"
+            "作答——口径与数仓实现一致，解释完可顺带告诉用户可以直接问这个指标的数值；"
+            "若问的概念不在清单里，用你的背景知识简洁解释。\n"
             "- 若问题需要当前/实时信息（天气、新闻、最新资讯、汇率、股价、热点等），"
             "调用 search_tool 搜索后再回答，并附上「信息来源」。\n"
             "- 若用户提到数据或指标但表述不明确，引导其说清要查询的指标与时间范围。\n"
-            "- 不编造任何数据或数字；涉及具体数值的问题交由数据查询链路回答。"
+            "- 不编造任何数据或数字；涉及具体数值的问题交由数据查询链路回答。\n"
+            "\n本系统指标口径：\n" + metric_digest
         )
         hist = render_history(history)
         user = question if not hist else f"对话历史：\n{hist}\n\n当前问题：{question}"
         from tools.search import search_tool_schema
 
         llm = self._get_llm(False)
+        # 概念题快链路（无工具轮）：释义已在 system 里，无需联网检索 —— 跳过工具 schema
+        # 序列化与 LLM 的工具决策轮，直接流式作答（agnes 首字从 ~10s 压回 ~3.5s）。
+        # 未知领域/实时热点不在此列：它们没有概念题意图，仍走带工具轮的完整 casual 路径。
+        from orchestration.dialogue import _is_concept_question
+
+        if _is_concept_question(question):
+            for kind, text in llm.stream_complete(system, user):
+                if kind == "reasoning":
+                    cleaned = _sanitize_reasoning(text)
+                    if cleaned is not None:
+                        yield kind, cleaned
+                else:
+                    yield kind, text
+            return
         # thinking 开启（有需要思考的闲聊展示思考过程），reasoning 经防泄漏过滤
         for kind, text in llm.stream_complete_with_tools(system, user, [search_tool_schema()]):
             if kind == "reasoning":
@@ -397,6 +442,10 @@ class Pipeline:
         """
         from tools.search import web_search
         from tools.contract import ToolError
+
+        # 生成器惰性：第一个 yield 前不执行函数体 —— 先发「正在联网检索…」过渡提示，
+        # 再执行阻塞的 web_search，UI 不白屏
+        yield "phase", "正在联网检索…"
 
         cfg = self.cfg.search
         if cfg is None:

@@ -36,7 +36,7 @@ from orchestration.prompts import build_system_prompt
 from orchestration.relevance import check_relevance
 from retrieval.rewrite import rewrite
 from retrieval.query_rewrite import rewrite_query
-from tools.contract import ToolError, serialize_result
+from tools.contract import ToolError, render_insights, serialize_result
 from orchestration.tool_router import route_tool_intent
 from tools.inventory import inventory_diagnostic_tool
 from tools.marketing import marketing_roi_funnel_tool
@@ -117,6 +117,32 @@ def _jsonable_state(final: dict) -> dict:
     string upstream (_tool_chart); no go.Figure ever leaves.
     """
     return {k: v for k, v in final.items() if k != "messages"}
+
+
+def _render_tool_result_text(res: str) -> str | None:
+    """Deterministic fallback: render a raw tool-result JSON as human-readable text.
+
+    When the tool round exhausts its rounds with the LLM still calling tools,
+    ``tool_answer`` is the raw ToolResult JSON (data/insights/chart, with sku_id /
+    on_hand etc. uncleaned). Leaking that as the chat answer is the "raw JSON exposed"
+    bug — render the insights bullets (the chart is already extracted separately into
+    ``_tool_chart``) or a compact row table (execute_tool's plain JSON-array results)
+    instead. Returns None when ``res`` isn't a renderable tool payload.
+    """
+    try:
+        payload = json.loads(res)
+    except Exception:
+        return None
+    if isinstance(payload, dict) and "insights" in payload:
+        text = render_insights(payload.get("insights") or [])
+        return text or None
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        cols = list(payload[0].keys())
+        head = " | ".join(cols)
+        rows = [" | ".join(str(r.get(c, "")) for c in cols) for r in payload[:20]]
+        more = "" if len(payload) <= 20 else f"\n…（共 {len(payload)} 行）"
+        return f"工具查询结果（前 {min(len(payload), 20)} 行）：\n{head}\n" + "\n".join(rows) + more
+    return None
 
 
 def _build_tool_user(question: str, tool_result: str | None) -> str:
@@ -364,13 +390,28 @@ class DsaiGraph:
         tool_answer: str | None = None
         sq: SemanticQuery | None = None
         reasoning_parts: list[str] = []
+        on_reasoning = self._reasoning_hook(config)
         upd: dict = {"messages": msgs[start:]}
         for round_i in range(self._TOOL_MAX_ROUNDS):
-            content, tool_calls = llm.complete_with_tools(
-                self._tool_system_prompt(state),
-                _build_tool_user(state["question"], tool_answer), schemas)
-            if getattr(llm, "last_reasoning", None):
-                reasoning_parts.append(llm.last_reasoning)
+            # 流式（而非 complete_with_tools）：工具轮是流水线上最长的一段无输出等待
+            # （提示词带工具契约，实测 2.4~6.2s）。逐块转发推理链，思考面板不再冻结在
+            # 「正在调用诊断工具…」上；聚合后的 reasoning 与原先一次性的 last_reasoning 等价。
+            content_parts: list[str] = []
+            round_reasoning: list[str] = []
+            for kind, text in llm.stream_complete_with_tools(
+                    self._tool_system_prompt(state),
+                    _build_tool_user(state["question"], tool_answer), schemas):
+                if kind == "reasoning":
+                    round_reasoning.append(text)
+                    if on_reasoning is not None:
+                        on_reasoning(text)
+                else:
+                    content_parts.append(text)
+            if round_reasoning:
+                # 每轮聚合后再并入：直接逐块 append 会让 "\n\n".join 在块间插空行
+                reasoning_parts.append("".join(round_reasoning))
+            content = "".join(content_parts).strip()
+            tool_calls = getattr(llm, "last_tool_calls", None)
             if not tool_calls:
                 # LLM didn't call a tool → output is a semantic-query JSON or insight-answer text
                 if _looks_like_json(content):
@@ -408,6 +449,13 @@ class DsaiGraph:
         # tool failed and LLM didn't converge → fall back to semantic-query path (no raw error as the answer)
         if tool_answer and (tool_answer.startswith("工具调用失败") or tool_answer.startswith("Error:")):
             return upd, None, None
+        # rounds exhausted (or the LLM echoed JSON) while tool_answer is still a raw tool
+        # payload → render it human-readable; never leak uncleaned JSON (sku_id/on_hand …)
+        # as the chat answer.
+        if tool_answer and _looks_like_json(tool_answer):
+            rendered = _render_tool_result_text(tool_answer)
+            if rendered is not None:
+                tool_answer = rendered
         return upd, tool_answer, sq
 
     def _emit_phase(self, label: str) -> None:
@@ -415,6 +463,11 @@ class DsaiGraph:
         cb = getattr(self, "_on_phase", None)
         if cb is not None:
             cb(label)
+
+    @staticmethod
+    def _reasoning_hook(config):
+        """Live-thinking callback from the run config (None outside the streaming chat UI)."""
+        return (config or {}).get("configurable", {}).get("on_reasoning")
 
     # ---------- nodes ----------
 
@@ -465,7 +518,7 @@ class DsaiGraph:
             return {"execution_error": None, "_reflect_fixed": False}
         with self._span("generate", input={"retry": state.get("retry_count")}):
             llm = self.p._get_llm(self._use_alt)
-            on_reasoning = (config or {}).get("configurable", {}).get("on_reasoning")
+            on_reasoning = self._reasoning_hook(config)
             # optional tool-call round (stage 3-4E): only when intent routing hits a diagnostic domain
             # (inventory/marketing funnel), avoiding an extra tools-armed LLM call for ordinary questions
             upd: dict = {}
@@ -521,7 +574,8 @@ class DsaiGraph:
                     if err:
                         errors.append(err)
                     else:
-                        # 3) execute
+                        # 3) execute —— SQL 实际执行前给过渡提示（思考结束→正文的查询期不白屏）
+                        self._emit_phase("正在执行查询…")
                         err, res = self._call_tool("execute_tool", {"sql": sql}, msgs, config)
                         if err:
                             errors.append(err)
@@ -659,7 +713,7 @@ class DsaiGraph:
                 "retry_count": state.get("retry_count", 0) + 1,
             }
 
-    def reflect_empty_node(self, state: AgentState) -> dict:
+    def reflect_empty_node(self, state: AgentState, config=None) -> dict:
         """Empty-result reflection: when execution returns [], let the LLM decide true-no-data vs relaxable.
 
         Two actions:
@@ -689,7 +743,7 @@ class DsaiGraph:
                 "查询执行返回空结果。请判定 confirm 或 relax。"
             )
             try:
-                raw = llm.complete(system, user)
+                raw = llm.complete_stream(system, user, on_reasoning=self._reasoning_hook(config))
                 decision = _parse_reflect_empty(raw)
                 if decision["action"] == "relax":
                     new_sq = _relax_window(sq)
@@ -713,11 +767,12 @@ class DsaiGraph:
                 return {"empty_result": True,
                         "error_feedback": f"空结果反思失败（{e}），按确认无数据降级"}
 
-    def reflect_node(self, state: AgentState) -> dict:
+    def reflect_node(self, state: AgentState, config=None) -> dict:
         """Reflect by error type: granularity → feed back to add a dimension; reference/logic/dialect → LLM rewrite."""
         categories = state.get("error_categories", [])
         cat = categories[-1] if categories else "unknown"
         feedback = state.get("error_feedback", "")
+        on_reasoning = self._reasoning_hook(config)
         # granularity mismatch: question asks grouping/filtering but query has none → feed back to add a dim
         if state.get("intent_mismatch"):
             with self._span("reflect", output={"kind": "granularity",
@@ -732,7 +787,7 @@ class DsaiGraph:
                 )
                 user = f"问题：{state['question']}\n错位原因：{feedback}"
                 try:
-                    raw = llm.complete(system, user)
+                    raw = llm.complete_stream(system, user, on_reasoning=on_reasoning)
                     sq = self.p._parse_semantic_query(raw)
                     return {"semantic_query": sq, "_reflect_fixed": True,
                             "intent_mismatch": False,
@@ -753,7 +808,7 @@ class DsaiGraph:
             system, user = build_repair_prompt(
                 state["question"], metric, cat, error, self.layer, feedback)
             try:
-                raw = llm.complete(system, user)
+                raw = llm.complete_stream(system, user, on_reasoning=on_reasoning)
                 sq = self.p._parse_semantic_query(raw)
                 # rewrite succeeded: mark to skip generate, straight to tools with the fixed query
                 return {"semantic_query": sq, "_reflect_fixed": True,
@@ -792,10 +847,11 @@ class DsaiGraph:
                     sq, state.get("execution_result"),
                     state["retrieved_tables"], state.get("compiled_sql"))
                 # soul risk ②: a relaxed caliber must be disclosed when yielding a number
+                # (plain language — the 口径 jargon stays out of the chat bubble)
                 if state.get("_relaxed"):
                     note = state.get("error_feedback", "")
-                    answer = (f"{answer}\n\n⚠ 口径说明：原始单日窗口无数据，"
-                              f"已将窗口放宽到 {sq.window.value} 后给出当月数据。\n{note}")
+                    answer = (f"{answer}\n\n⚠ 说明：您查询的 {sq.window.value} 单日无数据，"
+                              f"已将窗口放宽后给出当月数据。\n{note}")
                 return {"answer": answer}
             # hallucination block: question is out of answerable range, return no wrong data
             if state.get("hallucination"):

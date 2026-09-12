@@ -104,6 +104,7 @@ def build_system_prompt(layer: SemanticLayer, schema_text: str, today: str) -> s
 {_dsl_schema(today)}
 
 # 规则
+- 思考过程（reasoning/CoT）必须使用与用户提问相同的语言——用户用中文提问时必须全程用中文思考与拆解，绝不切换为英文。
 - 今天的日期：{today}。「上个月」按今天往前推一个月；明确给月份就用该月。
 - 问「昨天/今天/某一天」的指标 → 用 day 窗口（window.type="day"，value=YYYY-MM-DD）。「昨天」= {yesterday}。
 - 月粒度指标默认 window.type="month"；只有明确问单日才用 day 窗口（复购率等滚动窗口指标不支持 day，只用 month）。

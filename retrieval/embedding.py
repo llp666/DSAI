@@ -12,6 +12,11 @@ import json
 import requests
 from openai import OpenAI
 
+# (connect, read) 秒。连接阶段必须短：api.jina.ai 不可达时 120s 的连接超时会让检索节点
+# 整整挂两分钟才掉进关键词兜底（实测撞到过 ConnectTimeout 120s），而检索本该是秒级。
+# 读阶段留宽：一次批量嵌入本身要几秒。
+HTTP_TIMEOUT = (5, 30)
+
 
 class Embedder:
     def __init__(self, provider: str, base_url: str, api_key: str, model: str,
@@ -32,7 +37,7 @@ class Embedder:
         else:  # openai-compatible
             self._openai_client = OpenAI(
                 base_url=base_url, api_key=api_key,
-                default_headers={"X-Failover-Enabled": "true"}, timeout=120)
+                default_headers={"X-Failover-Enabled": "true"}, timeout=HTTP_TIMEOUT[1])
 
     def encode(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
         to_fetch: list[str] = []
@@ -64,7 +69,7 @@ class Embedder:
                 self._base_url, headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self._api_key}"},
-                data=json.dumps(payload), timeout=120)
+                data=json.dumps(payload), timeout=HTTP_TIMEOUT)
             r.raise_for_status()
             data = r.json()
             return [d["embedding"] for d in data["data"]]
@@ -79,6 +84,21 @@ class Embedder:
 
     def encode_one(self, text: str, *, query: bool = False) -> list[float]:
         return self.encode([text], query=query)[0]
+
+    def warm_up(self) -> None:
+        """Open the HTTP connection (DNS + TLS) ahead of the first real query.
+
+        进程内第一次嵌入实测 ~1970ms，热态 ~320ms — 差值全是握手。app 启动时先热一下，
+        把这一秒多从用户的第一个问题里挪走。直连 ``_encode_api`` 以避开缓存（不污染
+        缓存键）。尽力而为：失败静默吞掉（嵌入不可达时检索层本就会降级到纯关键词）。
+
+        注意这是**尽力而为**：连接池空闲久了仍会被对端回收，热启动只保证「开 app 立刻提问」
+        这条最常见路径不付握手钱。
+        """
+        try:
+            self._encode_api(["预热"], query=True)
+        except Exception:
+            pass
 
     def _cache_key(self, text: str, query: bool) -> str:
         return ("q" if query else "d") + self._provider + text
@@ -99,7 +119,7 @@ class Reranker:
             "Authorization": f"Bearer {self._key}"},
             json={"model": self._model, "query": query,
                   "documents": documents, "top_n": top_n,
-                  "return_documents": False}, timeout=120)
+                  "return_documents": False}, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         out = []

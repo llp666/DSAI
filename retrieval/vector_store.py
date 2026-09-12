@@ -64,6 +64,13 @@ class VectorStore:
             })
         return out
 
+    def warm_up(self) -> None:
+        """Best-effort connection warm-up (delegates to the embedder); never raises."""
+        try:
+            self._embedder.warm_up()
+        except Exception:
+            pass
+
     @property
     def count(self) -> int:
         return self._col.count()

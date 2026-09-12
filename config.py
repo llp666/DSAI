@@ -72,9 +72,21 @@ class Config:
     semantic_layer_path: Path
     meta_dir: Path
     reference_date: str | None = None
+    # per-question Langfuse flush wait (seconds); 0 = fire-and-forget. The SDK exports from
+    # its own background thread, so waiting only matters so short-lived processes (eval
+    # scripts) don't exit before the last traces ship — cap it so an unreachable Langfuse
+    # server can't stall the answer path (it retries with backoff for ~50s otherwise).
+    langfuse_flush_timeout: float = 2.0
     embedding: EmbeddingConfig | None = None
     alt_embedding: EmbeddingConfig | None = None
     rerank: RerankConfig | None = None
+    # rerank is opt-in. A/B on the 30-question retrieval set: RRF-only Recall@3 88.9% /
+    # MRR 0.950 vs RRF+jina-rerank 88.9% / 0.894 — retrieve_hybrid truncates to Top-3
+    # *before* reranking, so the reranker can only reorder (Recall@3 unchanged by
+    # construction) and it reorders worse, at ~2s per question. Kept as a seam:
+    # RERANK_ENABLED=true re-enables it, `eval.run_retrieval_eval --hybrid --rerank`
+    # reproduces the A/B regardless of this switch.
+    rerank_enabled: bool = False
     search: SearchConfig | None = None
 
 
@@ -135,9 +147,11 @@ def load_config(env_path: str | Path | None = None) -> Config:
         ),
         meta_dir=Path(os.environ.get("META_DIR", "meta")),
         reference_date=(os.environ.get("REFERENCE_DATE") or None),
+        langfuse_flush_timeout=float(os.environ.get("LANGFUSE_FLUSH_TIMEOUT", "2")),
         embedding=_embedding_from_env("EMBEDDING", "gitee"),
         alt_embedding=_embedding_from_env("ALT_EMBEDDING", "jina"),
         rerank=(rerank if rerank.api_key and rerank.model else None),
+        rerank_enabled=os.environ.get("RERANK_ENABLED", "false").lower() == "true",
         search=(search if search.api_key else None),
     )
 

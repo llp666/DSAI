@@ -17,6 +17,12 @@ _COUNTING_HINT = (
     "数是多少", "数量是多少", "有多少", "多少个", "数有几个", "数量是", "一共", "总数",
 )
 
+# 只有这些域里的计数题才值得再跑一轮工具轮：tool-round 提示词里有一条专门规则，把
+# 「断货 SKU 数是多少」这类聚合计数题引向 stockout_skus_count 指标而非 SKU 明细工具。
+# 其他计数题（订单数是多少 / 退款笔数）语义层已有对应指标，直连生成链路即可，
+# 没必要让 LLM 在带工具的提示词下再判一次（那轮是非流式的，思考面板全程冻结）。
+_COUNT_DIAGNOSTIC_DOMAIN = ("库存", "断货", "呆滞", "sku", "补货")
+
 TOOL_INTENT_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("inventory_diagnostic",
      ("哪些SKU断货", "哪个SKU断货", "SKU断货", "呆滞", "可售天数", "还够卖",
@@ -51,20 +57,31 @@ class ToolIntent:
 
 
 def route_tool_intent(question: str) -> ToolIntent:
-    """Keyword routing: hit → tool name; miss → None (LLM fallback optional)."""
+    """Keyword routing: hit → tool name; miss → None (LLM fallback optional).
+
+    工具轮是流水线上最贵的一段（非流式 LLM 往返），所以只有确实需要诊断工具的提问才进：
+    精确规则命中，或库存域里规则覆盖不到的措辞（交给工具轮 LLM 兜底判定）。
+    """
     q = question.lower()
-    # aggregate-count questions → not the SKU-level tool; let the tool-round LLM judge → SQL
+    # aggregate counts: early-return BEFORE the rule loop so 「断货SKU数是多少」 isn't
+    # hijacked by the SKU-明细 rule. 只有库存域的计数题还需要工具轮消歧。
     if any(w in q for w in _COUNTING_HINT):
         sku_level = any(w in q for w in ("还够卖", "能卖几天", "可售天数", "呆滞", "库存预警"))
         if not sku_level:
-            return ToolIntent(tool=None, rule=None, needs_llm=True)
+            return ToolIntent(tool=None, rule=None,
+                              needs_llm=any(w in q for w in _COUNT_DIAGNOSTIC_DOMAIN))
     for tool, words in TOOL_INTENT_RULES:
         for w in words:
             if w.lower() in q:
                 return ToolIntent(tool=tool, rule=w)
-    # domain words without an exact diagnostic intent → worth an LLM fallback
-    domain_hint = any(k in q for k in ("库存", "sku", "存货", "仓库", "采购", "供应商")) \
-        or any(k in q for k in ("roi", "广告", "投放", "转化"))
+    # 兜底判定只留给库存域。刻意不再列入这些词：
+    # - 「sku」：商品/排行题（卖得最好的SKU是哪个）大量误命中，而 SKU 明细诊断已被上面的
+    #   规则表覆盖；
+    # - 「roi/广告/投放/转化」：都是平量指标题（各渠道ROI是多少），语义层已有 marketing_roi
+    #   指标；进工具轮反而会诱使 LLM 去调尚未实现的 marketing_tool（必然报错、连调两轮，
+    #   实测把一次调用拖成三次）；
+    # - 漏斗语义（漏斗/转化链路）本身就是规则词，永远先命中规则，无需兜底词。
+    domain_hint = any(k in q for k in ("库存", "存货", "仓库", "采购", "供应商"))
     return ToolIntent(tool=None, rule=None, needs_llm=domain_hint)
 
 
